@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>C++ Custom-VM Obfuscator</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #1e1e2e; color: #eee; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; }
+  .sub { color: #aaa; font-size: 13px; margin-bottom: 20px; }
+  .row { display: flex; gap: 16px; }
+  .panel { flex: 1; display: flex; flex-direction: column; }
+  textarea { width: 100%; height: 480px; background: #11111b; color: #cdd6f4; border: 1px solid #444; border-radius: 6px; padding: 12px; font-family: Menlo, monospace; font-size: 13px; box-sizing: border-box; resize: vertical; }
+  button { margin: 14px 0; padding: 10px 20px; background: #89b4fa; color: #11111b; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 14px; }
+  button:hover { background: #a6c8ff; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  label { font-size: 13px; color: #ccc; margin-bottom: 6px; display: block; }
+  #report { background: #181825; border-radius: 6px; padding: 12px; font-size: 12px; font-family: Menlo, monospace; margin-top: 10px; white-space: pre-wrap; min-height: 20px; }
+</style>
+</head>
+<body>
+  <h1>C++ Custom-VM Obfuscator</h1>
+  <div class="sub">Paste C++ code. Eligible functions (int arithmetic / comparisons / if / return) get converted to custom VM bytecode. Everything else is passed through with identifiers renamed.</div>
+
+  <div class="row">
+    <div class="panel">
+      <label>Input (your C++ code)</label>
+      <textarea id="input" spellcheck="false">#include &lt;iostream&gt;
+
+int calculateRiskScore(int a, int b) {
+    int score = a * 7 + b * 3;
+    if (score &gt; 100) {
+        return 1;
+    }
+    return 0;
+}
+
+int main() {
+    std::cout &lt;&lt; calculateRiskScore(20, 5) &lt;&lt; std::endl;
+    std::cout &lt;&lt; calculateRiskScore(3, 10) &lt;&lt; std::endl;
+    return 0;
+}</textarea>
+    </div>
+    <div class="panel">
+      <label>Output (obfuscated C++)</label>
+      <textarea id="output" readonly spellcheck="false" placeholder="Obfuscated output will appear here..."></textarea>
+    </div>
+  </div>
+
+  <button id="go">Obfuscate</button>
+  <div id="report"></div>
+
+<script>
+document.getElementById('go').addEventListener('click', async () => {
+  const btn = document.getElementById('go');
+  const input = document.getElementById('input').value;
+  const output = document.getElementById('output');
+  const report = document.getElementById('report');
+  btn.disabled = true;
+  btn.textContent = "Working...";
+  output.value = "";
+  report.textContent = "";
+  try {
+    const res = await fetch('/obfuscate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: input })
+    });
+    const data = await res.json();
+    if (data.error) {
+      report.textContent = "Error: " + data.error;
+    } else {
+      output.value = data.obfuscated_code;
+      let txt = "Per-function report:\n" + data.report.map(r => "  - " + r).join("\n");
+      if (data.parse_warnings && data.parse_warnings.length) {
+        txt += "\n\nParse warnings:\n" + data.parse_warnings.map(w => "  - " + w).join("\n");
+      }
+      report.textContent = txt;
+    }
+  } catch (e) {
+    report.textContent = "Request failed: " + e;
+  }
+  btn.disabled = false;
+  btn.textContent = "Obfuscate";
+});
+</script>
+</body>
+</html>
