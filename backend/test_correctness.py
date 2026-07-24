@@ -1,5 +1,4 @@
 import clang.cindex as ci
-ci.Config.set_library_file('/usr/lib/x86_64-linux-gnu/libclang-18.so.1')
 import sys
 sys.path.insert(0, '/home/claude/obfuscator/backend')
 from bytecode_gen import *
