@@ -53,7 +53,40 @@ def _macos_clang_args():
     print(f"[_macos_clang_args] resolved args: {args}")
     return args
 
-VM_RUNTIME = r'''
+def generate_vm_runtime(opcode_shuffle_map=None):
+    mapping = opcode_shuffle_map or {}
+
+    op_bodies = [
+        (0x01, "{ uint8_t r = fetch8(c), a = fetch8(c); c.regs[r] = c.args[a]; break; }"),
+        (0x02, "{ uint8_t r = fetch8(c); c.regs[r] = fetch64(c); break; }"),
+        (0x03, "{ uint8_t r = fetch8(c), s = fetch8(c); c.regs[r] = c.regs[s]; break; }"),
+        (0x04, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]+c.regs[b]; break; }"),
+        (0x05, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]-c.regs[b]; break; }"),
+        (0x06, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]*c.regs[b]; break; }"),
+        (0x07, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]/c.regs[b]; break; }"),
+        (0x08, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]%c.regs[b]; break; }"),
+        (0x09, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]>c.regs[b]; break; }"),
+        (0x0A, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]>=c.regs[b]; break; }"),
+        (0x0B, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]<c.regs[b]; break; }"),
+        (0x0C, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]<=c.regs[b]; break; }"),
+        (0x0D, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]==c.regs[b]; break; }"),
+        (0x0E, "{ uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]!=c.regs[b]; break; }"),
+        (0x0F, "{ c.pc = fetch16(c); break; }"),
+        (0x10, "{ uint8_t r=fetch8(c); uint16_t t=fetch16(c); if (c.regs[r]!=0) c.pc=t; break; }"),
+        (0x11, "{ uint8_t r=fetch8(c); uint16_t t=fetch16(c); if (c.regs[r]==0) c.pc=t; break; }"),
+        (0x12, "{ return fetch64(c); }"),
+        (0x13, "{ uint8_t r=fetch8(c); return c.regs[r]; }"),
+        (0x14, "{ break; }"),
+    ]
+
+    cases = []
+    for orig_op, body in op_bodies:
+        target_op = mapping.get(orig_op, orig_op)
+        cases.append(f"            case 0x{target_op:02x}: {body}")
+
+    cases_str = "\n".join(cases)
+
+    return f"""\
 // ============================================================
 // Embedded VM runtime (auto-generated, do not edit by hand)
 // Same opcode format as the Android custom-VM research project.
@@ -61,62 +94,48 @@ VM_RUNTIME = r'''
 #include <cstdint>
 #include <cstddef>
 
-namespace vm_rt {
+namespace vm_rt {{
 
-struct VMContext {
-    int64_t regs[16] = {0};
+struct VMContext {{
+    int64_t regs[16] = {{0}};
     const uint8_t* bytecode = nullptr;
     size_t bytecode_len = 0;
     size_t pc = 0;
     const int64_t* args = nullptr;
     int arg_count = 0;
-};
+}};
 
-inline uint8_t fetch8(VMContext& c) { return c.bytecode[c.pc++]; }
-inline uint16_t fetch16(VMContext& c) {
+inline uint8_t fetch8(VMContext& c) {{ return c.bytecode[c.pc++]; }}
+inline uint16_t fetch16(VMContext& c) {{
     uint16_t lo = fetch8(c), hi = fetch8(c);
     return static_cast<uint16_t>(lo | (hi << 8));
-}
-inline int64_t fetch64(VMContext& c) {
+}}
+inline int64_t fetch64(VMContext& c) {{
     uint64_t v = 0;
     for (int i = 0; i < 8; i++) v |= (uint64_t)c.bytecode[c.pc + i] << (8 * i);
     c.pc += 8;
     int64_t r; __builtin_memcpy(&r, &v, 8);
     return r;
-}
+}}
 
-inline int64_t run(const uint8_t* bytecode, size_t len, const int64_t* args, int argc) {
+inline int64_t run(const uint8_t* bytecode, size_t len, const int64_t* args, int argc) {{
     VMContext c;
     c.bytecode = bytecode; c.bytecode_len = len; c.args = args; c.arg_count = argc;
-    while (true) {
+    while (true) {{
         uint8_t op = fetch8(c);
-        switch (op) {
-            case 0x01: { uint8_t r = fetch8(c), a = fetch8(c); c.regs[r] = c.args[a]; break; }
-            case 0x02: { uint8_t r = fetch8(c); c.regs[r] = fetch64(c); break; }
-            case 0x03: { uint8_t r = fetch8(c), s = fetch8(c); c.regs[r] = c.regs[s]; break; }
-            case 0x04: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]+c.regs[b]; break; }
-            case 0x05: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]-c.regs[b]; break; }
-            case 0x06: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]*c.regs[b]; break; }
-            case 0x07: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]/c.regs[b]; break; }
-            case 0x08: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]%c.regs[b]; break; }
-            case 0x09: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]>c.regs[b]; break; }
-            case 0x0A: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]>=c.regs[b]; break; }
-            case 0x0B: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]<c.regs[b]; break; }
-            case 0x0C: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]<=c.regs[b]; break; }
-            case 0x0D: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]==c.regs[b]; break; }
-            case 0x0E: { uint8_t r=fetch8(c),a=fetch8(c),b=fetch8(c); c.regs[r]=c.regs[a]!=c.regs[b]; break; }
-            case 0x0F: { c.pc = fetch16(c); break; }
-            case 0x10: { uint8_t r=fetch8(c); uint16_t t=fetch16(c); if (c.regs[r]!=0) c.pc=t; break; }
-            case 0x11: { uint8_t r=fetch8(c); uint16_t t=fetch16(c); if (c.regs[r]==0) c.pc=t; break; }
-            case 0x12: { return fetch64(c); }
-            case 0x13: { uint8_t r=fetch8(c); return c.regs[r]; }
+        switch (op) {{
+{cases_str}
             default: return 0;
-        }
-    }
-}
+        }}
+    }}
+}}
 
-} // namespace vm_rt
-'''
+}} // namespace vm_rt
+"""
+
+
+VM_RUNTIME = generate_vm_runtime()
+
 
 
 def random_name(prefix="v"):

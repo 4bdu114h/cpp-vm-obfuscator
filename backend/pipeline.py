@@ -5,6 +5,7 @@ Executes ordered stages over a shared PipelineContext.
 """
 from dataclasses import dataclass, field
 from typing import Any, List, Dict, Tuple
+import random
 import re
 import clang.cindex as ci
 from bytecode_gen import eligibility_check, FunctionCompiler
@@ -22,9 +23,63 @@ class PipelineContext:
     eligible_funcs: List[Tuple[Any, bytes]] = field(default_factory=list)
     fallback_funcs: List[Any] = field(default_factory=list)
     rename_map: Dict[str, str] = field(default_factory=dict)
+    opcode_shuffle_map: Dict[int, int] = field(default_factory=dict)
     report: List[str] = field(default_factory=list)
     diag_errors: List[str] = field(default_factory=list)
     final_code: str = ""
+
+
+def generate_opcode_shuffle(seed: int | None = None) -> dict[int, int]:
+    """Returns a random bijective mapping {original_opcode: shuffled_opcode}
+    covering every value in bytecode_gen.ALL_OPCODES. Uses `seed` if given
+    (for reproducible/testable output), otherwise a fresh random shuffle."""
+    from bytecode_gen import ALL_OPCODES
+    rng = random.Random(seed)
+    shuffled = ALL_OPCODES.copy()
+    rng.shuffle(shuffled)
+    return dict(zip(ALL_OPCODES, shuffled))
+
+
+def apply_opcode_shuffle(bytecode: bytes, mapping: dict[int, int]) -> bytes:
+    """Forward direction: `bytecode` uses ORIGINAL opcode values, `mapping`
+    is {original: shuffled}. Widths are looked up directly from the
+    original opcode byte (correct, since input bytes are original)."""
+    from bytecode_gen import OPCODE_OPERAND_WIDTHS
+    out = bytearray()
+    i = 0
+    while i < len(bytecode):
+        op = bytecode[i]
+        if op not in OPCODE_OPERAND_WIDTHS:
+            raise ValueError(f"unknown opcode 0x{op:02x} at offset {i}")
+        width = OPCODE_OPERAND_WIDTHS[op]
+        out.append(mapping[op])
+        out.extend(bytecode[i + 1 : i + 1 + width])
+        i += 1 + width
+    return bytes(out)
+
+
+def apply_inverse_opcode_shuffle(shuffled_bytecode: bytes, mapping: dict[int, int]) -> bytes:
+    """Reverse direction: `shuffled_bytecode` uses SHUFFLED opcode values,
+    `mapping` is still {original: shuffled} (the same forward mapping -
+    this function builds and uses its own inverse internally). Widths must
+    be looked up via the ORIGINAL opcode (found through the inverse map),
+    never from the shuffled byte directly, since a shuffled byte value
+    does not correspond to its own true instruction width."""
+    from bytecode_gen import OPCODE_OPERAND_WIDTHS
+    inverse = {v: k for k, v in mapping.items()}
+    out = bytearray()
+    i = 0
+    while i < len(shuffled_bytecode):
+        shuffled_op = shuffled_bytecode[i]
+        if shuffled_op not in inverse:
+            raise ValueError(f"unknown shuffled opcode 0x{shuffled_op:02x} at offset {i}")
+        orig_op = inverse[shuffled_op]
+        width = OPCODE_OPERAND_WIDTHS[orig_op]
+        out.append(orig_op)
+        out.extend(shuffled_bytecode[i + 1 : i + 1 + width])
+        i += 1 + width
+    return bytes(out)
+
 
 
 def stage_parse(ctx: PipelineContext) -> None:
@@ -82,6 +137,18 @@ def stage_virtualize(ctx: PipelineContext) -> None:
         ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
 
 
+def stage_shuffle_opcodes(ctx: PipelineContext) -> None:
+    if not ctx.eligible_funcs:
+        return
+    ctx.opcode_shuffle_map = generate_opcode_shuffle()
+    new_eligible = []
+    for f, bc in ctx.eligible_funcs:
+        shuffled_bc = apply_opcode_shuffle(bc, ctx.opcode_shuffle_map)
+        new_eligible.append((f, shuffled_bc))
+        ctx.artifacts[f.spelling] = shuffled_bc
+    ctx.eligible_funcs = new_eligible
+
+
 def stage_rename_fallback(ctx: PipelineContext) -> None:
     from codegen import random_name
 
@@ -96,7 +163,7 @@ def stage_rename_fallback(ctx: PipelineContext) -> None:
 
 
 def stage_assemble_output(ctx: PipelineContext) -> None:
-    from codegen import random_name, bytes_to_c_array, VM_RUNTIME
+    from codegen import random_name, bytes_to_c_array, generate_vm_runtime
 
     output_parts = [
         "// ================================================================\n"
@@ -106,7 +173,7 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
         "// with local identifiers renamed.\n"
         "// ================================================================\n",
         "\n".join(ctx.include_lines) + "\n\n" if ctx.include_lines else "",
-        VM_RUNTIME,
+        generate_vm_runtime(ctx.opcode_shuffle_map),
         "\n// ---- Bytecode-backed functions ----\n",
     ]
 
@@ -141,6 +208,7 @@ PIPELINE_STAGES = [
     stage_parse,
     stage_eligibility_check,
     stage_virtualize,
+    stage_shuffle_opcodes,
     stage_rename_fallback,
     stage_assemble_output,
 ]

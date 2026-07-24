@@ -39,6 +39,32 @@ BIN_OP_TO_OPCODE = {
     '==': OP_CMP_EQ, '!=': OP_CMP_NE,
 }
 
+OPCODE_OPERAND_WIDTHS = {
+    OP_LOAD_ARG: 2,
+    OP_LOAD_CONST: 9,
+    OP_MOV: 2,
+    OP_ADD: 3,
+    OP_SUB: 3,
+    OP_MUL: 3,
+    OP_DIV: 3,
+    OP_MOD: 3,
+    OP_CMP_GT: 3,
+    OP_CMP_GE: 3,
+    OP_CMP_LT: 3,
+    OP_CMP_LE: 3,
+    OP_CMP_EQ: 3,
+    OP_CMP_NE: 3,
+    OP_JMP: 2,
+    OP_JMP_IF_TRUE: 3,
+    OP_JMP_IF_FALSE: 3,
+    OP_RET_CONST: 8,
+    OP_RET_REG: 1,
+    OP_HALT: 0,
+}
+
+ALL_OPCODES = list(OPCODE_OPERAND_WIDTHS.keys())
+
+
 ALLOWED_KINDS = {
     ci.CursorKind.FUNCTION_DECL, ci.CursorKind.PARM_DECL,
     ci.CursorKind.COMPOUND_STMT, ci.CursorKind.DECL_STMT,
