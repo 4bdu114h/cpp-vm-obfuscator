@@ -250,6 +250,22 @@ def stage_shuffle_opcodes(ctx: PipelineContext) -> None:
     ctx.artifacts["shared_bytecode"] = shuffled_shared_bc
 
 
+def fnv1a_32(data: bytes) -> int:
+    h = 0x811c9dc5
+    for b in data:
+        h ^= b
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def stage_compute_bytecode_checksum(ctx: PipelineContext) -> None:
+    if not ctx.eligible_funcs:
+        return
+    shared_bc = ctx.artifacts.get("shared_bytecode", b"")
+    checksum = fnv1a_32(shared_bc)
+    ctx.artifacts["bytecode_checksum"] = checksum
+
+
 def stage_rename_fallback(ctx: PipelineContext) -> None:
     from codegen import random_name
 
@@ -417,6 +433,9 @@ def stage_encrypt_strings(ctx: PipelineContext) -> None:
 def stage_assemble_output(ctx: PipelineContext) -> None:
     from codegen import random_name, bytes_to_c_array, generate_vm_runtime
 
+    checksum = ctx.artifacts.get("bytecode_checksum", 0)
+    checksum_str = f"0x{checksum:08x}u"
+
     output_parts = [
         "// ================================================================\n"
         "// Auto-generated obfuscated output.\n"
@@ -444,7 +463,7 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
             output_parts.append(
                 f"int {f.spelling}({param_list}) {{\n"
                 f"    int64_t __args[] = {{ {args_init} }};\n"
-                f"    return (int)vm_rt::run({arr_name}, {arr_name}_len, __args, {len(params)}, {offset});\n"
+                f"    return (int)vm_rt::run({arr_name}, {arr_name}_len, __args, {len(params)}, {offset}, {checksum_str});\n"
                 f"}}\n\n"
             )
 
@@ -471,6 +490,7 @@ PIPELINE_STAGES = [
     stage_eligibility_check,
     stage_virtualize,
     stage_shuffle_opcodes,
+    stage_compute_bytecode_checksum,
     stage_rename_fallback,
     stage_obfuscate_literals,
     stage_encrypt_strings,

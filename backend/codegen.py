@@ -128,7 +128,19 @@ inline int64_t fetch64(VMContext& c) {{
     return r;
 }}
 
-inline int64_t run(const uint8_t* bytecode, size_t len, const int64_t* args, int argc, size_t entry_pc = 0) {{
+inline uint32_t fnv1a_32(const uint8_t* data, size_t len) {{
+    uint32_t hash = 0x811c9dc5u;
+    for (size_t i = 0; i < len; i++) {{
+        hash ^= data[i];
+        hash *= 0x01000193u;
+    }}
+    return hash;
+}}
+
+inline int64_t run(const uint8_t* bytecode, size_t len, const int64_t* args, int argc, size_t entry_pc = 0, uint32_t expected_checksum = 0) {{
+    if (expected_checksum != 0 && fnv1a_32(bytecode, len) != expected_checksum) {{
+        return 0;
+    }}
     VMContext c;
     c.bytecode = bytecode; c.bytecode_len = len; c.args = args; c.arg_count = argc; c.pc = entry_pc;
     while (true) {{
