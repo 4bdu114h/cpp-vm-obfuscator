@@ -72,7 +72,8 @@ ALLOWED_KINDS = {
     ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.DECL_REF_EXPR,
     ci.CursorKind.INTEGER_LITERAL, ci.CursorKind.IF_STMT,
     ci.CursorKind.RETURN_STMT, ci.CursorKind.PAREN_EXPR,
-    ci.CursorKind.UNARY_OPERATOR,
+    ci.CursorKind.UNARY_OPERATOR, ci.CursorKind.WHILE_STMT,
+    ci.CursorKind.FOR_STMT,
 }
 
 
@@ -125,9 +126,20 @@ class BytecodeBuilder:
         self.code += bytes([OP_JMP_IF_TRUE, r_cond, 0xFF, 0xFF])
         return len(self.code) - 2
 
+    def jmp_if_false(self, r_cond):
+        self.code += bytes([OP_JMP_IF_FALSE, r_cond, 0xFF, 0xFF])
+        return len(self.code) - 2
+
     def jmp(self):
         self.code += bytes([OP_JMP, 0xFF, 0xFF])
         return len(self.code) - 2
+
+    def jmp_to(self, target):
+        """Unconditional jump to an ALREADY KNOWN address (e.g. jumping
+        backward to a loop's start) - unlike self.jmp(), which returns a
+        patch location for a FORWARD target not yet known."""
+        self.code += bytes([OP_JMP])
+        self.code += int(target).to_bytes(2, "little")
 
     def patch(self, patch_at, target):
         self.code[patch_at] = target & 0xFF
@@ -160,6 +172,9 @@ class FunctionCompiler:
         params = list(func_cursor.get_arguments())
         for i, p in enumerate(params):
             self.arg_index[p.spelling] = i
+            r = self.alloc_reg()
+            self.b.load_arg(r, i)
+            self.var_reg[p.spelling] = r
 
         body = None
         for c in func_cursor.get_children():
@@ -201,6 +216,96 @@ class FunctionCompiler:
             self.compile_stmt(then_branch)
             end_target = self.b.here()
             self.b.patch(patch_skip_then, end_target)
+
+        elif node.kind == ci.CursorKind.WHILE_STMT:
+            children = list(node.get_children())
+            cond = children[0]
+            body = children[1]
+            loop_start = self.b.here()
+            cond_reg = self.compile_expr(cond)
+            patch_exit = self.b.jmp_if_false(cond_reg)
+            self.compile_stmt(body)
+            self.b.jmp_to(loop_start)
+            exit_target = self.b.here()
+            self.b.patch(patch_exit, exit_target)
+
+        elif node.kind == ci.CursorKind.FOR_STMT:
+            tokens = list(node.get_tokens())
+            semis = [t for t in tokens if t.spelling == ';'][:2]
+            semi1_start = semis[0].extent.start.offset if len(semis) > 0 else 0
+            semi2_start = semis[1].extent.start.offset if len(semis) > 1 else 0
+
+            children = list(node.get_children())
+            body_node = children[-1]
+            init_node, cond_node, inc_node = None, None, None
+            for c in children[:-1]:
+                c_start = c.extent.start.offset
+                if c_start < semi1_start:
+                    init_node = c
+                elif semi1_start <= c_start < semi2_start:
+                    cond_node = c
+                elif c_start > semi2_start:
+                    inc_node = c
+
+            if init_node:
+                self.compile_stmt(init_node)
+
+            loop_start = self.b.here()
+            patch_exit = None
+            if cond_node:
+                cond_reg = self.compile_expr(cond_node)
+                patch_exit = self.b.jmp_if_false(cond_reg)
+
+            self.compile_stmt(body_node)
+
+            if inc_node:
+                self.compile_stmt(inc_node)
+
+            self.b.jmp_to(loop_start)
+            exit_target = self.b.here()
+            if patch_exit is not None:
+                self.b.patch(patch_exit, exit_target)
+
+        elif node.kind == ci.CursorKind.BINARY_OPERATOR:
+            op_tok = self._binary_op_symbol(node)
+            if op_tok == '=':
+                children = list(node.get_children())
+                lhs, rhs = children[0], children[1]
+                r_src = self.compile_expr(rhs)
+                target = lhs
+                if target.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                    target = list(target.get_children())[0]
+                if target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.var_reg:
+                    r_dst = self.var_reg[target.spelling]
+                    self.copy_reg(r_dst, r_src)
+                else:
+                    raise RuntimeError(f"cannot assign to {target.spelling}")
+            else:
+                self.compile_expr(node)
+
+        elif node.kind == ci.CursorKind.UNARY_OPERATOR:
+            tokens = [t.spelling for t in node.get_tokens()]
+            children = list(node.get_children())
+            target = children[0]
+            if target.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                target = list(target.get_children())[0]
+            if target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.var_reg:
+                r_var = self.var_reg[target.spelling]
+                one_reg = self.alloc_reg()
+                self.b.load_const(one_reg, 1)
+                if '++' in tokens:
+                    self.b.binop(OP_ADD, r_var, r_var, one_reg)
+                elif '--' in tokens:
+                    self.b.binop(OP_SUB, r_var, r_var, one_reg)
+                else:
+                    raise RuntimeError(f"unsupported unary operator: {tokens}")
+            else:
+                raise RuntimeError(f"cannot increment/decrement {getattr(target, 'spelling', '<unknown>')}")
+
+        elif node.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+            children = list(node.get_children())
+            if children:
+                self.compile_stmt(children[0])
 
         elif node.kind == ci.CursorKind.RETURN_STMT:
             children = list(node.get_children())
@@ -269,15 +374,16 @@ class FunctionCompiler:
         # Clang doesn't expose the operator directly via cindex; recover it
         # from the token stream between the two child expressions.
         children = list(node.get_children())
-        lhs_extent_end = children[0].extent.end
-        rhs_extent_start = children[1].extent.start
-        for tok in node.get_tokens():
-            if (tok.extent.start.offset >= lhs_extent_end.offset and
-                    tok.extent.end.offset <= rhs_extent_start.offset):
-                if tok.spelling in BIN_OP_TO_OPCODE:
-                    return tok.spelling
+        if len(children) >= 2:
+            lhs_extent_end = children[0].extent.end
+            rhs_extent_start = children[1].extent.start
+            for tok in node.get_tokens():
+                if (tok.extent.start.offset >= lhs_extent_end.offset and
+                        tok.extent.end.offset <= rhs_extent_start.offset):
+                    if tok.spelling in BIN_OP_TO_OPCODE or tok.spelling == '=':
+                        return tok.spelling
         # fallback: scan all tokens for a known operator symbol
         for tok in node.get_tokens():
-            if tok.spelling in BIN_OP_TO_OPCODE:
+            if tok.spelling in BIN_OP_TO_OPCODE or tok.spelling == '=':
                 return tok.spelling
         raise RuntimeError("could not determine binary operator")
