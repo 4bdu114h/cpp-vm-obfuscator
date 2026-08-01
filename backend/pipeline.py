@@ -160,43 +160,92 @@ def stage_parse(ctx: PipelineContext) -> None:
 
 
 def stage_eligibility_check(ctx: PipelineContext) -> None:
+    # Pass 1: Identify all leaf eligible functions (no CALL_EXPR nodes)
+    known_leaf_names = set()
     for f in ctx.funcs:
-        ok, reason = eligibility_check(f)
+        ok, reason = eligibility_check(f, known_leaf_functions=set())
         if ok:
             body = next((c for c in f.get_children()
                          if c.kind == ci.CursorKind.COMPOUND_STMT), None)
             if body is not None and len(list(body.get_children())) == 0:
                 ok, reason = False, "function body parsed as empty (likely a parse issue, not real code)"
+            else:
+                known_leaf_names.add(f.spelling)
         ctx.treatments[f] = (ok, reason)
+
+    # Pass 2: Identify caller functions that call only known leaf functions
+    for f in ctx.funcs:
+        if not ctx.treatments[f][0]:
+            ok, reason = eligibility_check(f, known_leaf_functions=known_leaf_names)
+            if ok:
+                body = next((c for c in f.get_children()
+                             if c.kind == ci.CursorKind.COMPOUND_STMT), None)
+                if body is not None and len(list(body.get_children())) == 0:
+                    ok, reason = False, "function body parsed as empty (likely a parse issue, not real code)"
+                else:
+                    ctx.treatments[f] = (True, "eligible (caller)")
 
 
 def stage_virtualize(ctx: PipelineContext) -> None:
+    leaf_funcs = []
+    caller_funcs = []
     for f in ctx.funcs:
         ok, reason = ctx.treatments.get(f, (False, "unknown"))
         if ok:
-            try:
-                compiler = FunctionCompiler()
-                bc = compiler.compile_function(f)
-                ctx.eligible_funcs.append((f, bc))
-                ctx.artifacts[f.spelling] = bc
-                ctx.report.append(f"{f.spelling}: VIRTUALIZED ({len(bc)} bytes of bytecode)")
-                continue
-            except Exception as e:
-                reason = f"codegen failed: {e}"
-        ctx.fallback_funcs.append(f)
-        ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
+            if "caller" in reason:
+                caller_funcs.append(f)
+            else:
+                leaf_funcs.append(f)
+        else:
+            ctx.fallback_funcs.append(f)
+            ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
+
+    shared_bytecode = bytearray()
+    func_entry_offsets = {}
+
+    # Compile leaf functions first to establish their entry offsets
+    for f in leaf_funcs:
+        try:
+            offset = len(shared_bytecode)
+            func_entry_offsets[f.spelling] = offset
+            compiler = FunctionCompiler(start_offset=offset, func_entry_offsets=func_entry_offsets)
+            bc = compiler.compile_function(f)
+            shared_bytecode.extend(bc)
+            ctx.eligible_funcs.append((f, offset))
+            ctx.artifacts[f.spelling] = bc
+            ctx.report.append(f"{f.spelling}: VIRTUALIZED ({len(bc)} bytes of bytecode)")
+        except Exception as e:
+            reason = f"codegen failed: {e}"
+            ctx.fallback_funcs.append(f)
+            ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
+
+    # Compile caller functions next using the established leaf offsets
+    for f in caller_funcs:
+        try:
+            offset = len(shared_bytecode)
+            func_entry_offsets[f.spelling] = offset
+            compiler = FunctionCompiler(start_offset=offset, func_entry_offsets=func_entry_offsets)
+            bc = compiler.compile_function(f)
+            shared_bytecode.extend(bc)
+            ctx.eligible_funcs.append((f, offset))
+            ctx.artifacts[f.spelling] = bc
+            ctx.report.append(f"{f.spelling}: VIRTUALIZED ({len(bc)} bytes of bytecode)")
+        except Exception as e:
+            reason = f"codegen failed: {e}"
+            ctx.fallback_funcs.append(f)
+            ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
+
+    ctx.artifacts["shared_bytecode"] = bytes(shared_bytecode)
+    ctx.func_entry_offsets = func_entry_offsets
 
 
 def stage_shuffle_opcodes(ctx: PipelineContext) -> None:
     if not ctx.eligible_funcs:
         return
     ctx.opcode_shuffle_map = generate_opcode_shuffle()
-    new_eligible = []
-    for f, bc in ctx.eligible_funcs:
-        shuffled_bc = apply_opcode_shuffle(bc, ctx.opcode_shuffle_map)
-        new_eligible.append((f, shuffled_bc))
-        ctx.artifacts[f.spelling] = shuffled_bc
-    ctx.eligible_funcs = new_eligible
+    shared_bc = ctx.artifacts["shared_bytecode"]
+    shuffled_shared_bc = apply_opcode_shuffle(shared_bc, ctx.opcode_shuffle_map)
+    ctx.artifacts["shared_bytecode"] = shuffled_shared_bc
 
 
 def stage_rename_fallback(ctx: PipelineContext) -> None:
@@ -280,18 +329,20 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
         "\n// ---- Bytecode-backed functions ----\n",
     ]
 
-    for f, bc in ctx.eligible_funcs:
-        arr_name = random_name("bc_")
-        params = list(f.get_arguments())
-        param_list = ", ".join(f"int {p.spelling}" for p in params)
-        args_init = ", ".join(f"(int64_t){p.spelling}" for p in params)
-        output_parts.append(bytes_to_c_array(arr_name, bc))
-        output_parts.append(
-            f"int {f.spelling}({param_list}) {{\n"
-            f"    int64_t __args[] = {{ {args_init} }};\n"
-            f"    return (int)vm_rt::run({arr_name}, {arr_name}_len, __args, {len(params)});\n"
-            f"}}\n\n"
-        )
+    if ctx.eligible_funcs:
+        shared_bc = ctx.artifacts["shared_bytecode"]
+        arr_name = random_name("shared_bc_")
+        output_parts.append(bytes_to_c_array(arr_name, shared_bc))
+        for f, offset in ctx.eligible_funcs:
+            params = list(f.get_arguments())
+            param_list = ", ".join(f"int {p.spelling}" for p in params)
+            args_init = ", ".join(f"(int64_t){p.spelling}" for p in params)
+            output_parts.append(
+                f"int {f.spelling}({param_list}) {{\n"
+                f"    int64_t __args[] = {{ {args_init} }};\n"
+                f"    return (int)vm_rt::run({arr_name}, {arr_name}_len, __args, {len(params)}, {offset});\n"
+                f"}}\n\n"
+            )
 
     if ctx.fallback_funcs:
         output_parts.append("\n// ---- Renamed (non-virtualized) functions ----\n")

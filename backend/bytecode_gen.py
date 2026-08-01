@@ -34,6 +34,7 @@ OP_RET_REG = 0x13
 OP_HALT = 0x14
 OP_ARR_LOAD = 0x15
 OP_ARR_STORE = 0x16
+OP_CALL = 0x17
 
 BIN_OP_TO_OPCODE = {
     '+': OP_ADD, '-': OP_SUB, '*': OP_MUL, '/': OP_DIV, '%': OP_MOD,
@@ -64,6 +65,7 @@ OPCODE_OPERAND_WIDTHS = {
     OP_HALT: 0,
     OP_ARR_LOAD: 3,
     OP_ARR_STORE: 3,
+    OP_CALL: 7,
 }
 
 ALL_OPCODES = list(OPCODE_OPERAND_WIDTHS.keys())
@@ -78,14 +80,18 @@ ALLOWED_KINDS = {
     ci.CursorKind.RETURN_STMT, ci.CursorKind.PAREN_EXPR,
     ci.CursorKind.UNARY_OPERATOR, ci.CursorKind.WHILE_STMT,
     ci.CursorKind.FOR_STMT, ci.CursorKind.ARRAY_SUBSCRIPT_EXPR,
-    ci.CursorKind.INIT_LIST_EXPR,
+    ci.CursorKind.INIT_LIST_EXPR, ci.CursorKind.CALL_EXPR,
 }
 
 
-def eligibility_check(func_cursor):
+def eligibility_check(func_cursor, known_leaf_functions=None):
     """Returns (True, reason) if this function can be fully virtualized,
     (False, reason) otherwise. Only allows: int params, int locals,
-    fixed-size int arrays, arithmetic, comparisons, loops, if/return."""
+    fixed-size int arrays, arithmetic, comparisons, loops, if/return,
+    and single-level calls to known leaf functions."""
+    if known_leaf_functions is None:
+        known_leaf_functions = set()
+
     # All parameters and the return type must be int
     if func_cursor.result_type.spelling not in ("int",):
         return False, f"unsupported return type '{func_cursor.result_type.spelling}'"
@@ -107,6 +113,27 @@ def eligibility_check(func_cursor):
             elif node.type.kind != ci.TypeKind.INT:
                 bad.append(f"unsupported variable type '{node.type.spelling}'")
                 return
+        elif node.kind == ci.CursorKind.CALL_EXPR:
+            callee_name = node.spelling
+            if not callee_name:
+                children = list(node.get_children())
+                if children:
+                    callee_name = children[0].spelling
+            if callee_name == func_cursor.spelling:
+                bad.append(f"recursive call to '{callee_name}'")
+                return
+            if callee_name not in known_leaf_functions:
+                bad.append(f"call to non-leaf/unknown function '{callee_name}'")
+                return
+            args = list(node.get_arguments())
+            if not args:
+                children = list(node.get_children())
+                if len(children) > 1:
+                    args = children[1:]
+            if len(args) > 4:
+                bad.append(f"call to '{callee_name}' with {len(args)} args (max 4 supported)")
+                return
+
         for c in node.get_children():
             walk(c)
 
@@ -119,11 +146,12 @@ def eligibility_check(func_cursor):
 class BytecodeBuilder:
     """Same role as interpreter/vm_assembler.h's Assembler class, but in
     Python, targeting the same byte format."""
-    def __init__(self):
+    def __init__(self, start_offset=0):
+        self.start_offset = start_offset
         self.code = bytearray()
 
     def here(self):
-        return len(self.code)
+        return self.start_offset + len(self.code)
 
     def load_arg(self, r_dst, arg_index):
         self.code += bytes([OP_LOAD_ARG, r_dst, arg_index])
@@ -137,15 +165,15 @@ class BytecodeBuilder:
 
     def jmp_if_true(self, r_cond):
         self.code += bytes([OP_JMP_IF_TRUE, r_cond, 0xFF, 0xFF])
-        return len(self.code) - 2
+        return self.start_offset + len(self.code) - 2
 
     def jmp_if_false(self, r_cond):
         self.code += bytes([OP_JMP_IF_FALSE, r_cond, 0xFF, 0xFF])
-        return len(self.code) - 2
+        return self.start_offset + len(self.code) - 2
 
     def jmp(self):
         self.code += bytes([OP_JMP, 0xFF, 0xFF])
-        return len(self.code) - 2
+        return self.start_offset + len(self.code) - 2
 
     def jmp_to(self, target):
         """Unconditional jump to an ALREADY KNOWN address (e.g. jumping
@@ -155,8 +183,9 @@ class BytecodeBuilder:
         self.code += int(target).to_bytes(2, "little")
 
     def patch(self, patch_at, target):
-        self.code[patch_at] = target & 0xFF
-        self.code[patch_at + 1] = (target >> 8) & 0xFF
+        rel_patch_at = patch_at - self.start_offset
+        self.code[rel_patch_at] = target & 0xFF
+        self.code[rel_patch_at + 1] = (target >> 8) & 0xFF
 
     def ret_const(self, value):
         self.code += bytes([OP_RET_CONST])
@@ -171,16 +200,25 @@ class BytecodeBuilder:
     def arr_store(self, base_offset, r_idx, r_src):
         self.code += bytes([OP_ARR_STORE, base_offset, r_idx, r_src])
 
+    def call(self, callee_offset, arg_regs, r_dst):
+        args_padded = list(arg_regs) + [0xFF] * (4 - len(arg_regs))
+        self.code += bytes([OP_CALL])
+        self.code += int(callee_offset).to_bytes(2, "little")
+        self.code += bytes(args_padded[:4])
+        self.code += bytes([r_dst])
+
 
 class FunctionCompiler:
     """Compiles one eligible function's AST into bytecode."""
-    def __init__(self):
-        self.b = BytecodeBuilder()
+    def __init__(self, start_offset=0, func_entry_offsets=None):
+        self.start_offset = start_offset
+        self.b = BytecodeBuilder(start_offset=start_offset)
         self.next_reg = 0
         self.var_reg = {}   # variable name -> register index
         self.arg_index = {}  # param name -> arg index
         self.next_mem_offset = 0
         self.array_offsets = {}  # array name -> (base_offset, size)
+        self.func_entry_offsets = func_entry_offsets or {}  # callee name -> offset
 
     def alloc_reg(self):
         r = self.next_reg
@@ -440,6 +478,29 @@ class FunctionCompiler:
             dst_reg = self.alloc_reg()
             self.b.arr_load(dst_reg, base_offset, idx_reg)
             return dst_reg
+
+        if node.kind == ci.CursorKind.CALL_EXPR:
+            callee_name = node.spelling
+            if not callee_name:
+                children = list(node.get_children())
+                if children:
+                    callee_name = children[0].spelling
+            if callee_name not in self.func_entry_offsets:
+                raise RuntimeError(f"unknown callee function: '{callee_name}'")
+            callee_offset = self.func_entry_offsets[callee_name]
+
+            args = list(node.get_arguments())
+            if not args:
+                children = list(node.get_children())
+                if len(children) > 1:
+                    args = children[1:]
+            if len(args) > 4:
+                raise RuntimeError(f"call to '{callee_name}' has {len(args)} args (max 4 supported)")
+
+            arg_regs = [self.compile_expr(a) for a in args]
+            r_dst = self.alloc_reg()
+            self.b.call(callee_offset, arg_regs, r_dst)
+            return r_dst
 
         if node.kind == ci.CursorKind.BINARY_OPERATOR:
             children = list(node.get_children())

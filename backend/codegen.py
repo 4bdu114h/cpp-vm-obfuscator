@@ -74,11 +74,12 @@ def generate_vm_runtime(opcode_shuffle_map=None):
         (0x0F, "{ c.pc = fetch16(c); break; }"),
         (0x10, "{ uint8_t r=fetch8(c); uint16_t t=fetch16(c); if (c.regs[r]!=0) c.pc=t; break; }"),
         (0x11, "{ uint8_t r=fetch8(c); uint16_t t=fetch16(c); if (c.regs[r]==0) c.pc=t; break; }"),
-        (0x12, "{ return fetch64(c); }"),
-        (0x13, "{ uint8_t r=fetch8(c); return c.regs[r]; }"),
+        (0x12, "{ int64_t v = fetch64(c); if (c.in_call) { __builtin_memcpy(c.regs, c.saved_regs, sizeof(c.regs)); c.regs[c.call_dst_reg] = v; c.args = c.saved_args; c.pc = c.saved_pc; c.in_call = false; break; } return v; }"),
+        (0x13, "{ uint8_t r = fetch8(c); int64_t v = c.regs[r]; if (c.in_call) { __builtin_memcpy(c.regs, c.saved_regs, sizeof(c.regs)); c.regs[c.call_dst_reg] = v; c.args = c.saved_args; c.pc = c.saved_pc; c.in_call = false; break; } return v; }"),
         (0x14, "{ break; }"),
         (0x15, "{ uint8_t r = fetch8(c), base = fetch8(c), idx_r = fetch8(c); c.regs[r] = c.mem[base + c.regs[idx_r]]; break; }"),
         (0x16, "{ uint8_t base = fetch8(c), idx_r = fetch8(c), src_r = fetch8(c); c.mem[base + c.regs[idx_r]] = c.regs[src_r]; break; }"),
+        (0x17, "{ uint16_t target = fetch16(c); uint8_t a0 = fetch8(c), a1 = fetch8(c), a2 = fetch8(c), a3 = fetch8(c); uint8_t r_dst = fetch8(c); __builtin_memcpy(c.saved_regs, c.regs, sizeof(c.regs)); c.saved_pc = c.pc; c.saved_args = c.args; c.in_call = true; c.call_dst_reg = r_dst; c.call_args[0] = (a0 != 0xFF) ? c.regs[a0] : 0; c.call_args[1] = (a1 != 0xFF) ? c.regs[a1] : 0; c.call_args[2] = (a2 != 0xFF) ? c.regs[a2] : 0; c.call_args[3] = (a3 != 0xFF) ? c.regs[a3] : 0; __builtin_memset(c.regs, 0, sizeof(c.regs)); c.args = c.call_args; c.pc = target; break; }"),
     ]
 
     cases = []
@@ -101,6 +102,12 @@ namespace vm_rt {{
 struct VMContext {{
     int64_t regs[16] = {{0}};
     int64_t mem[256] = {{0}};
+    int64_t saved_regs[16] = {{0}};
+    size_t saved_pc = 0;
+    bool in_call = false;
+    uint8_t call_dst_reg = 0;
+    int64_t call_args[4] = {{0}};
+    const int64_t* saved_args = nullptr;
     const uint8_t* bytecode = nullptr;
     size_t bytecode_len = 0;
     size_t pc = 0;
@@ -121,9 +128,9 @@ inline int64_t fetch64(VMContext& c) {{
     return r;
 }}
 
-inline int64_t run(const uint8_t* bytecode, size_t len, const int64_t* args, int argc) {{
+inline int64_t run(const uint8_t* bytecode, size_t len, const int64_t* args, int argc, size_t entry_pc = 0) {{
     VMContext c;
-    c.bytecode = bytecode; c.bytecode_len = len; c.args = args; c.arg_count = argc;
+    c.bytecode = bytecode; c.bytecode_len = len; c.args = args; c.arg_count = argc; c.pc = entry_pc;
     while (true) {{
         uint8_t op = fetch8(c);
         switch (op) {{
