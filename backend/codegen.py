@@ -97,7 +97,32 @@ def generate_vm_runtime(opcode_shuffle_map=None):
 #include <cstdint>
 #include <cstddef>
 
+#if defined(__APPLE__)
+#include <sys/ptrace.h>
+#elif defined(__linux__)
+#include <sys/ptrace.h>
+#endif
+
 namespace vm_rt {{
+
+inline bool anti_debug_check() {{
+#if defined(__APPLE__)
+    ptrace(PT_DENY_ATTACH, 0, 0, 0);
+    return false;
+#elif defined(__linux__)
+    if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == -1) {{
+        return true;
+    }}
+    return false;
+#else
+    return false;
+#endif
+}}
+
+inline bool& debugger_detected_flag() {{
+    static bool detected = anti_debug_check();
+    return detected;
+}}
 
 struct VMContext {{
     int64_t regs[16] = {{0}};
@@ -138,6 +163,9 @@ inline uint32_t fnv1a_32(const uint8_t* data, size_t len) {{
 }}
 
 inline int64_t run(const uint8_t* bytecode, size_t len, const int64_t* args, int argc, size_t entry_pc = 0, uint32_t expected_checksum = 0) {{
+    if (debugger_detected_flag()) {{
+        return 0;
+    }}
     if (expected_checksum != 0 && fnv1a_32(bytecode, len) != expected_checksum) {{
         return 0;
     }}
