@@ -29,6 +29,57 @@ class PipelineContext:
     final_code: str = ""
 
 
+def obfuscate_number_literal(value: int) -> str:
+    """Given an integer literal's value, returns a C++ expression string
+    that evaluates to exactly that value, disguised as arithmetic.
+    Must be wrapped in parentheses so it's safe to substitute anywhere
+    the original literal appeared."""
+    if value < 0:
+        pos_str = obfuscate_number_literal(abs(value))
+        return f"(-{pos_str})"
+
+    if value >= 0x7FFFFFFF - 1000:
+        return f"(0x{value:x} ^ 0x0)"
+
+    if value == 0:
+        r = random.randint(1, 100)
+        strats = [
+            f"(0x{r:x} - 0x{r:x})",
+            f"(0x{r:x} ^ 0x{r:x})",
+            f"(0x0 * 0x{r:x})",
+            "(0x0 ^ 0x0)",
+        ]
+        return random.choice(strats)
+
+    strategies = []
+
+    # Strategy 1: Addition split (value = a + b)
+    if value > 1:
+        a = random.randint(1, value - 1)
+        b = value - a
+        strategies.append(f"(0x{a:x} + 0x{b:x})")
+    else:
+        strategies.append(f"(0x0 + 0x{value:x})")
+
+    # Strategy 2: Subtraction split (value = a - b)
+    b = random.randint(1, 100)
+    a = value + b
+    strategies.append(f"(0x{a:x} - 0x{b:x})")
+
+    # Strategy 3: Multiplication-then-add (value = quot * m + rem)
+    m = random.choice([2, 3, 4, 5])
+    quot = value // m
+    rem = value % m
+    strategies.append(f"(0x{quot:x} * 0x{m:x} + 0x{rem:x})")
+
+    # Strategy 4: Bitwise XOR (value = a ^ k)
+    k = random.randint(1, 255)
+    a = value ^ k
+    strategies.append(f"(0x{a:x} ^ 0x{k:x})")
+
+    return random.choice(strategies)
+
+
 def generate_opcode_shuffle(seed: int | None = None) -> dict[int, int]:
     """Returns a random bijective mapping {original_opcode: shuffled_opcode}
     covering every value in bytecode_gen.ALL_OPCODES. Uses `seed` if given
@@ -79,7 +130,6 @@ def apply_inverse_opcode_shuffle(shuffled_bytecode: bytes, mapping: dict[int, in
         out.extend(shuffled_bytecode[i + 1 : i + 1 + width])
         i += 1 + width
     return bytes(out)
-
 
 
 def stage_parse(ctx: PipelineContext) -> None:
@@ -162,6 +212,59 @@ def stage_rename_fallback(ctx: PipelineContext) -> None:
     ctx.artifacts["rename_map"] = rename_map
 
 
+def stage_obfuscate_literals(ctx: PipelineContext) -> None:
+    """Finds all INTEGER_LITERAL AST nodes in fallback functions using exact token byte offsets.
+    Replaces each integer literal with an obfuscated arithmetic expression, then applies
+    identifier renaming to the resulting text to guarantee offset safety."""
+    if not ctx.fallback_funcs:
+        return
+
+    with open(ctx.filename) as f:
+        original_text = f.read()
+
+    for func in ctx.fallback_funcs:
+        func_start = func.extent.start.offset
+        func_end = func.extent.end.offset
+        func_text = original_text[func_start:func_end]
+
+        replacements = []
+        seen_spans = set()
+        for node in func.walk_preorder():
+            if node.kind == ci.CursorKind.INTEGER_LITERAL:
+                tokens = list(node.get_tokens())
+                if tokens:
+                    tok = tokens[0]
+                    tok_start = tok.extent.start.offset
+                    tok_end = tok.extent.end.offset
+                    if func_start <= tok_start < tok_end <= func_end:
+                        span = (tok_start - func_start, tok_end - func_start)
+                        if span not in seen_spans:
+                            seen_spans.add(span)
+                            try:
+                                val = int(tok.spelling, 0)
+                            except ValueError:
+                                continue
+                            obf_expr = obfuscate_number_literal(val)
+                            replacements.append((span[0], span[1], obf_expr))
+
+        # Pass 1: Offset-based slicing for integer literal replacements
+        replacements.sort(key=lambda x: x[0])
+        pieces = []
+        last_pos = 0
+        for rel_start, rel_end, obf_expr in replacements:
+            pieces.append(func_text[last_pos:rel_start])
+            pieces.append(obf_expr)
+            last_pos = rel_end
+        pieces.append(func_text[last_pos:])
+        obfuscated_text = "".join(pieces)
+
+        # Pass 2: Identifier renaming regex substitution on the obfuscated text
+        for old, new in ctx.rename_map.items():
+            obfuscated_text = re.sub(rf"\b{re.escape(old)}\b", new, obfuscated_text)
+
+        ctx.artifacts[f"{func.spelling}_obfuscated_text"] = obfuscated_text
+
+
 def stage_assemble_output(ctx: PipelineContext) -> None:
     from codegen import random_name, bytes_to_c_array, generate_vm_runtime
 
@@ -192,13 +295,17 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
 
     if ctx.fallback_funcs:
         output_parts.append("\n// ---- Renamed (non-virtualized) functions ----\n")
-        with open(ctx.filename) as f:
-            original_text = f.read()
         for f in ctx.fallback_funcs:
-            start, end = f.extent.start.offset, f.extent.end.offset
-            func_text = original_text[start:end]
-            for old, new in ctx.rename_map.items():
-                func_text = re.sub(rf"\b{re.escape(old)}\b", new, func_text)
+            obf_key = f"{f.spelling}_obfuscated_text"
+            if obf_key in ctx.artifacts:
+                func_text = ctx.artifacts[obf_key]
+            else:
+                with open(ctx.filename) as file_obj:
+                    original_text = file_obj.read()
+                start, end = f.extent.start.offset, f.extent.end.offset
+                func_text = original_text[start:end]
+                for old, new in ctx.rename_map.items():
+                    func_text = re.sub(rf"\b{re.escape(old)}\b", new, func_text)
             output_parts.append(func_text + "\n\n")
 
     ctx.final_code = "".join(output_parts)
@@ -210,6 +317,7 @@ PIPELINE_STAGES = [
     stage_virtualize,
     stage_shuffle_opcodes,
     stage_rename_fallback,
+    stage_obfuscate_literals,
     stage_assemble_output,
 ]
 
