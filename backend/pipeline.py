@@ -24,6 +24,8 @@ class PipelineContext:
     fallback_funcs: List[Any] = field(default_factory=list)
     rename_map: Dict[str, str] = field(default_factory=dict)
     opcode_shuffle_map: Dict[int, int] = field(default_factory=dict)
+    string_decode_helpers: List[str] = field(default_factory=list)
+    func_replacements: Dict[Any, List[Tuple[int, int, str]]] = field(default_factory=dict)
     report: List[str] = field(default_factory=list)
     diag_errors: List[str] = field(default_factory=list)
     final_code: str = ""
@@ -261,22 +263,66 @@ def stage_rename_fallback(ctx: PipelineContext) -> None:
     ctx.artifacts["rename_map"] = rename_map
 
 
+def decode_cpp_string_literal(tok_spelling: str) -> bytes:
+    s = tok_spelling
+    quote_idx = s.find('"')
+    if quote_idx != -1 and s.endswith('"'):
+        s = s[quote_idx + 1:-1]
+    return s.encode("utf-8").decode("unicode_escape").encode("latin1")
+
+
+def is_safe_string_literal(node, parent_chain) -> bool:
+    if node.kind != ci.CursorKind.STRING_LITERAL:
+        return False
+    # Reject if any ancestor up to compound statement is VAR_DECL
+    for p in reversed(parent_chain):
+        if p.kind == ci.CursorKind.COMPOUND_STMT:
+            break
+        if p.kind == ci.CursorKind.VAR_DECL:
+            return False
+    # Must have a CALL_EXPR ancestor before compound stmt
+    for p in reversed(parent_chain):
+        if p.kind == ci.CursorKind.COMPOUND_STMT:
+            break
+        if p.kind == ci.CursorKind.CALL_EXPR:
+            return True
+    return False
+
+
+def generate_string_decode_function(func_name: str, raw_bytes: bytes, key: int) -> str:
+    enc_bytes = [b ^ key for b in raw_bytes]
+    enc_str = ", ".join(f"0x{b:02x}" for b in enc_bytes)
+    length = len(raw_bytes)
+    return f"""inline const char* {func_name}() {{
+    static char buf[{length + 1}] = {{0}};
+    static bool decoded = false;
+    if (!decoded) {{
+        static const unsigned char enc[] = {{ {enc_str} }};
+        const unsigned char key = 0x{key:02x};
+        for (int i = 0; i < {length}; i++) buf[i] = (char)(enc[i] ^ key);
+        buf[{length}] = '\\0';
+        decoded = true;
+    }}
+    return buf;
+}}"""
+
+
 def stage_obfuscate_literals(ctx: PipelineContext) -> None:
-    """Finds all INTEGER_LITERAL AST nodes in fallback functions using exact token byte offsets.
-    Replaces each integer literal with an obfuscated arithmetic expression, then applies
-    identifier renaming to the resulting text to guarantee offset safety."""
+    """Finds all INTEGER_LITERAL AST nodes in fallback functions using exact token byte offsets
+    and collects replacement tuples into ctx.func_replacements.
+
+    Note: This stage does NOT perform any text modification or slicing itself. The actual merged
+    text slicing and identifier renaming for both integer and string literal replacements occurs
+    in stage_encrypt_strings(), which MUST run after this stage in PIPELINE_STAGES for either
+    transform to take effect."""
     if not ctx.fallback_funcs:
         return
-
-    with open(ctx.filename) as f:
-        original_text = f.read()
 
     for func in ctx.fallback_funcs:
         func_start = func.extent.start.offset
         func_end = func.extent.end.offset
-        func_text = original_text[func_start:func_end]
 
-        replacements = []
+        replacements = ctx.func_replacements.setdefault(func, [])
         seen_spans = set()
         for node in func.walk_preorder():
             if node.kind == ci.CursorKind.INTEGER_LITERAL:
@@ -296,7 +342,61 @@ def stage_obfuscate_literals(ctx: PipelineContext) -> None:
                             obf_expr = obfuscate_number_literal(val)
                             replacements.append((span[0], span[1], obf_expr))
 
-        # Pass 1: Offset-based slicing for integer literal replacements
+
+def stage_encrypt_strings(ctx: PipelineContext) -> None:
+    """Finds all safe STRING_LITERAL AST nodes in fallback functions using exact token byte offsets.
+    Replaces safe string literals with call to unique inline decode helper functions.
+    Merges replacements with integer literal replacements, slices text once, and applies identifier renaming."""
+    from codegen import random_name
+
+    if not ctx.fallback_funcs:
+        return
+
+    with open(ctx.filename) as f:
+        original_text = f.read()
+
+    for func in ctx.fallback_funcs:
+        func_start = func.extent.start.offset
+        func_end = func.extent.end.offset
+        func_text = original_text[func_start:func_end]
+
+        replacements = ctx.func_replacements.setdefault(func, [])
+        seen_spans = {(r[0], r[1]) for r in replacements}
+
+        used_keys = set()
+
+        def get_unique_key():
+            for _ in range(1000):
+                k = random.randint(1, 255)
+                if k not in used_keys:
+                    used_keys.add(k)
+                    return k
+            return random.randint(1, 255)
+
+        def traverse(node, parents):
+            if node.kind == ci.CursorKind.STRING_LITERAL:
+                if is_safe_string_literal(node, parents):
+                    tokens = list(node.get_tokens())
+                    if tokens:
+                        tok = tokens[0]
+                        tok_start = tok.extent.start.offset
+                        tok_end = tok.extent.end.offset
+                        if func_start <= tok_start < tok_end <= func_end:
+                            span = (tok_start - func_start, tok_end - func_start)
+                            if span not in seen_spans:
+                                seen_spans.add(span)
+                                raw_b = decode_cpp_string_literal(tok.spelling)
+                                k = get_unique_key()
+                                h_name = random_name("str_dec_")
+                                h_code = generate_string_decode_function(h_name, raw_b, k)
+                                ctx.string_decode_helpers.append(h_code)
+                                replacements.append((span[0], span[1], f"{h_name}()"))
+            for c in node.get_children():
+                traverse(c, parents + [node])
+
+        traverse(func, [])
+
+        # Merge replacements (numbers + strings), sort by start_offset, slice text
         replacements.sort(key=lambda x: x[0])
         pieces = []
         last_pos = 0
@@ -307,7 +407,7 @@ def stage_obfuscate_literals(ctx: PipelineContext) -> None:
         pieces.append(func_text[last_pos:])
         obfuscated_text = "".join(pieces)
 
-        # Pass 2: Identifier renaming regex substitution on the obfuscated text
+        # Identifier renaming regex substitution on the obfuscated text
         for old, new in ctx.rename_map.items():
             obfuscated_text = re.sub(rf"\b{re.escape(old)}\b", new, obfuscated_text)
 
@@ -326,8 +426,12 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
         "// ================================================================\n",
         "\n".join(ctx.include_lines) + "\n\n" if ctx.include_lines else "",
         generate_vm_runtime(ctx.opcode_shuffle_map),
-        "\n// ---- Bytecode-backed functions ----\n",
     ]
+
+    if ctx.string_decode_helpers:
+        output_parts.append("\n// ---- String decode helpers ----\n" + "\n\n".join(ctx.string_decode_helpers) + "\n")
+
+    output_parts.append("\n// ---- Bytecode-backed functions ----\n")
 
     if ctx.eligible_funcs:
         shared_bc = ctx.artifacts["shared_bytecode"]
@@ -369,6 +473,7 @@ PIPELINE_STAGES = [
     stage_shuffle_opcodes,
     stage_rename_fallback,
     stage_obfuscate_literals,
+    stage_encrypt_strings,
     stage_assemble_output,
 ]
 
