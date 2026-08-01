@@ -77,6 +77,8 @@ def generate_vm_runtime(opcode_shuffle_map=None):
         (0x12, "{ return fetch64(c); }"),
         (0x13, "{ uint8_t r=fetch8(c); return c.regs[r]; }"),
         (0x14, "{ break; }"),
+        (0x15, "{ uint8_t r = fetch8(c), base = fetch8(c), idx_r = fetch8(c); c.regs[r] = c.mem[base + c.regs[idx_r]]; break; }"),
+        (0x16, "{ uint8_t base = fetch8(c), idx_r = fetch8(c), src_r = fetch8(c); c.mem[base + c.regs[idx_r]] = c.regs[src_r]; break; }"),
     ]
 
     cases = []
@@ -98,6 +100,7 @@ namespace vm_rt {{
 
 struct VMContext {{
     int64_t regs[16] = {{0}};
+    int64_t mem[256] = {{0}};
     const uint8_t* bytecode = nullptr;
     size_t bytecode_len = 0;
     size_t pc = 0;

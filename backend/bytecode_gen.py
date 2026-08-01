@@ -32,6 +32,8 @@ OP_JMP_IF_FALSE = 0x11
 OP_RET_CONST = 0x12
 OP_RET_REG = 0x13
 OP_HALT = 0x14
+OP_ARR_LOAD = 0x15
+OP_ARR_STORE = 0x16
 
 BIN_OP_TO_OPCODE = {
     '+': OP_ADD, '-': OP_SUB, '*': OP_MUL, '/': OP_DIV, '%': OP_MOD,
@@ -60,6 +62,8 @@ OPCODE_OPERAND_WIDTHS = {
     OP_RET_CONST: 8,
     OP_RET_REG: 1,
     OP_HALT: 0,
+    OP_ARR_LOAD: 3,
+    OP_ARR_STORE: 3,
 }
 
 ALL_OPCODES = list(OPCODE_OPERAND_WIDTHS.keys())
@@ -73,14 +77,15 @@ ALLOWED_KINDS = {
     ci.CursorKind.INTEGER_LITERAL, ci.CursorKind.IF_STMT,
     ci.CursorKind.RETURN_STMT, ci.CursorKind.PAREN_EXPR,
     ci.CursorKind.UNARY_OPERATOR, ci.CursorKind.WHILE_STMT,
-    ci.CursorKind.FOR_STMT,
+    ci.CursorKind.FOR_STMT, ci.CursorKind.ARRAY_SUBSCRIPT_EXPR,
+    ci.CursorKind.INIT_LIST_EXPR,
 }
 
 
 def eligibility_check(func_cursor):
     """Returns (True, reason) if this function can be fully virtualized,
     (False, reason) otherwise. Only allows: int params, int locals,
-    arithmetic, comparisons, if/return, integer literals."""
+    fixed-size int arrays, arithmetic, comparisons, loops, if/return."""
     # All parameters and the return type must be int
     if func_cursor.result_type.spelling not in ("int",):
         return False, f"unsupported return type '{func_cursor.result_type.spelling}'"
@@ -94,6 +99,14 @@ def eligibility_check(func_cursor):
         if node.kind not in ALLOWED_KINDS:
             bad.append(str(node.kind))
             return
+        if node.kind == ci.CursorKind.VAR_DECL:
+            if node.type.kind == ci.TypeKind.CONSTANTARRAY:
+                if node.type.element_type.spelling != "int":
+                    bad.append(f"non-int array '{node.type.spelling}'")
+                    return
+            elif node.type.kind != ci.TypeKind.INT:
+                bad.append(f"unsupported variable type '{node.type.spelling}'")
+                return
         for c in node.get_children():
             walk(c)
 
@@ -152,6 +165,12 @@ class BytecodeBuilder:
     def ret_reg(self, r_src):
         self.code += bytes([OP_RET_REG, r_src])
 
+    def arr_load(self, r_dst, base_offset, r_idx):
+        self.code += bytes([OP_ARR_LOAD, r_dst, base_offset, r_idx])
+
+    def arr_store(self, base_offset, r_idx, r_src):
+        self.code += bytes([OP_ARR_STORE, base_offset, r_idx, r_src])
+
 
 class FunctionCompiler:
     """Compiles one eligible function's AST into bytecode."""
@@ -160,6 +179,8 @@ class FunctionCompiler:
         self.next_reg = 0
         self.var_reg = {}   # variable name -> register index
         self.arg_index = {}  # param name -> arg index
+        self.next_mem_offset = 0
+        self.array_offsets = {}  # array name -> (base_offset, size)
 
     def alloc_reg(self):
         r = self.next_reg
@@ -167,6 +188,24 @@ class FunctionCompiler:
         if self.next_reg > 16:
             raise RuntimeError("ran out of registers (max 16 supported)")
         return r
+
+    def free_scratch_regs(self):
+        if self.var_reg:
+            self.next_reg = max(self.var_reg.values()) + 1
+        else:
+            self.next_reg = 0
+
+    def parse_array_subscript(self, node):
+        children = list(node.get_children())
+        base_node = children[0]
+        idx_node = children[1]
+        while base_node.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+            sub = list(base_node.get_children())
+            if sub:
+                base_node = sub[0]
+            else:
+                break
+        return base_node.spelling, idx_node
 
     def compile_function(self, func_cursor):
         params = list(func_cursor.get_arguments())
@@ -187,19 +226,47 @@ class FunctionCompiler:
         if node.kind == ci.CursorKind.COMPOUND_STMT:
             for c in node.get_children():
                 self.compile_stmt(c)
+                self.free_scratch_regs()
 
         elif node.kind == ci.CursorKind.DECL_STMT:
             for c in node.get_children():
                 self.compile_stmt(c)
+                self.free_scratch_regs()
 
         elif node.kind == ci.CursorKind.VAR_DECL:
-            children = list(node.get_children())
-            r = self.alloc_reg()
-            self.var_reg[node.spelling] = r
-            if children:
-                init_reg = self.compile_expr(children[0])
-                self.b.binop_mov = None  # not used; MOV via ADD-with-0 pattern avoided
-                self.copy_reg(r, init_reg)
+            if node.type.kind == ci.TypeKind.CONSTANTARRAY:
+                elem_type = node.type.element_type.spelling
+                if elem_type != "int":
+                    raise RuntimeError(f"unsupported array element type '{elem_type}'")
+                size = node.type.element_count
+                if self.next_mem_offset + size > 256:
+                    raise RuntimeError(f"array memory overflow: allocated {self.next_mem_offset + size} > 256")
+                base_offset = self.next_mem_offset
+                self.array_offsets[node.spelling] = (base_offset, size)
+                self.next_mem_offset += size
+
+                children = list(node.get_children())
+                init_list = None
+                for c in children:
+                    if c.kind == ci.CursorKind.INIT_LIST_EXPR:
+                        init_list = c
+                        break
+                if init_list:
+                    init_exprs = list(init_list.get_children())
+                    for idx, elem_expr in enumerate(init_exprs):
+                        val_reg = self.compile_expr(elem_expr)
+                        idx_reg = self.alloc_reg()
+                        self.b.load_const(idx_reg, idx)
+                        self.b.arr_store(base_offset, idx_reg, val_reg)
+                        self.free_scratch_regs()
+            else:
+                children = list(node.get_children())
+                r = self.alloc_reg()
+                self.var_reg[node.spelling] = r
+                if children:
+                    init_reg = self.compile_expr(children[0])
+                    self.b.binop_mov = None  # not used; MOV via ADD-with-0 pattern avoided
+                    self.copy_reg(r, init_reg)
 
         elif node.kind == ci.CursorKind.IF_STMT:
             children = list(node.get_children())
@@ -278,8 +345,15 @@ class FunctionCompiler:
                 if target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.var_reg:
                     r_dst = self.var_reg[target.spelling]
                     self.copy_reg(r_dst, r_src)
+                elif target.kind == ci.CursorKind.ARRAY_SUBSCRIPT_EXPR:
+                    arr_name, idx_node = self.parse_array_subscript(target)
+                    if arr_name not in self.array_offsets:
+                        raise RuntimeError(f"unknown array identifier: {arr_name}")
+                    base_offset, arr_size = self.array_offsets[arr_name]
+                    idx_reg = self.compile_expr(idx_node)
+                    self.b.arr_store(base_offset, idx_reg, r_src)
                 else:
-                    raise RuntimeError(f"cannot assign to {target.spelling}")
+                    raise RuntimeError(f"cannot assign to {getattr(target, 'spelling', '<unknown>')}")
             else:
                 self.compile_expr(node)
 
@@ -356,6 +430,16 @@ class FunctionCompiler:
             r = self.alloc_reg()
             self.b.load_const(r, val)
             return r
+
+        if node.kind == ci.CursorKind.ARRAY_SUBSCRIPT_EXPR:
+            arr_name, idx_node = self.parse_array_subscript(node)
+            if arr_name not in self.array_offsets:
+                raise RuntimeError(f"unknown array identifier: {arr_name}")
+            base_offset, arr_size = self.array_offsets[arr_name]
+            idx_reg = self.compile_expr(idx_node)
+            dst_reg = self.alloc_reg()
+            self.b.arr_load(dst_reg, base_offset, idx_reg)
+            return dst_reg
 
         if node.kind == ci.CursorKind.BINARY_OPERATOR:
             children = list(node.get_children())
