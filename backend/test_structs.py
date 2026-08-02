@@ -235,12 +235,11 @@ int badArrField(int x) {
     assert not el, "Struct with float field should be ineligible"
     assert "non-int" in reason.lower(), f"Unexpected reason: {reason}"
 
-    # Test struct param
+    # Test struct param (supported)
     tu = index.parse("/tmp/rej_param.cpp", unsaved_files=[("/tmp/rej_param.cpp", src_param)], args=["-std=c++17"] + _macos_clang_args())
     funcs = {cur.spelling: cur for cur in tu.cursor.get_children() if cur.kind == ci.CursorKind.FUNCTION_DECL}
     el, reason = eligibility_check(funcs["badParam"])
-    assert not el, "Struct parameter should be ineligible"
-    assert "unsupported parameter" in reason.lower(), f"Unexpected reason: {reason}"
+    assert el, f"Struct parameter should now be eligible, got: {reason}"
 
     # Test array inside struct
     tu = index.parse("/tmp/rej_arr.cpp", unsaved_files=[("/tmp/rej_arr.cpp", src_arr_field)], args=["-std=c++17"] + _macos_clang_args())

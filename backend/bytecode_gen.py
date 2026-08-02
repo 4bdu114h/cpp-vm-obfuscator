@@ -49,6 +49,9 @@ BIN_OP_TO_OPCODE = {
     '==': OP_CMP_EQ, '!=': OP_CMP_NE,
 }
 
+OP_RET_STRUCT = 0x1F
+OP_STRUCT_RET_LOAD = 0x20
+
 OPCODE_OPERAND_WIDTHS = {
     OP_LOAD_ARG: 2,
     OP_LOAD_CONST: 9,
@@ -80,6 +83,8 @@ OPCODE_OPERAND_WIDTHS = {
     OP_STR_NE: 3,
     OP_RET_STR: 1,
     OP_RET_STR_INT: 1,
+    OP_RET_STRUCT: 5,
+    OP_STRUCT_RET_LOAD: 2,
 }
 
 ALL_OPCODES = list(OPCODE_OPERAND_WIDTHS.keys())
@@ -102,9 +107,8 @@ ALLOWED_KINDS = {
 
 def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=None, struct_names=None):
     """Returns (True, reason) if this function can be fully virtualized,
-    (False, reason) otherwise. Only allows: int params, int locals,
-    fixed-size int arrays, int-fields-only struct locals, arithmetic, comparisons,
-    loops, if/return, and calls (including recursive / multi-level) with <= 4 args."""
+    (False, reason) otherwise. Only allows: int/struct params (total slots <= 4), int/struct locals,
+    fixed-size int arrays, arithmetic, comparisons, loops, if/return, and calls (including recursive / multi-level)."""
     if known_leaf_functions is not None and all_func_names is None:
         allowed_callees = known_leaf_functions
     else:
@@ -116,11 +120,41 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
     else:
         struct_names = struct_names or set()
 
-    # All parameters and the return type must be int
-    if func_cursor.result_type.spelling not in ("int",):
-        return False, f"unsupported return type '{func_cursor.result_type.spelling}'"
+    def get_struct_fields(decl_cursor):
+        if hasattr(decl_cursor.type, 'get_fields'):
+            fields = list(decl_cursor.type.get_fields())
+            if fields: return fields
+        return [c for c in decl_cursor.get_children() if c.kind == ci.CursorKind.FIELD_DECL]
+
+    # Return type check: int or int-only fields struct (max 4 fields)
+    ret_type = func_cursor.result_type
+    if ret_type.spelling != "int":
+        if ret_type.kind == ci.TypeKind.RECORD:
+            decl = ret_type.get_declaration()
+            fields = get_struct_fields(decl)
+            if not fields:
+                return False, f"unsupported return struct type '{ret_type.spelling}' (no fields)"
+            for f in fields:
+                if f.type.kind != ci.TypeKind.INT:
+                    return False, f"unsupported return struct field '{f.spelling}' of type '{f.type.spelling}' (non-int)"
+            if len(fields) > 4:
+                return False, f"unsupported return struct '{ret_type.spelling}' with {len(fields)} fields (max 4 supported)"
+        else:
+            return False, f"unsupported return type '{ret_type.spelling}'"
+
+    # Parameter check
     for p in func_cursor.get_arguments():
-        if p.type.spelling != "int":
+        if p.type.spelling == "int":
+            pass
+        elif p.type.kind == ci.TypeKind.RECORD:
+            decl = p.type.get_declaration()
+            fields = get_struct_fields(decl)
+            if not fields:
+                return False, f"unsupported struct parameter '{p.spelling}' (no fields)"
+            for f in fields:
+                if f.type.kind != ci.TypeKind.INT:
+                    return False, f"unsupported struct parameter field '{f.spelling}' of type '{f.type.spelling}' (non-int)"
+        else:
             return False, f"unsupported parameter type '{p.type.spelling}'"
 
     bad = []
@@ -169,8 +203,15 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
                 children = list(node.get_children())
                 if len(children) > 1:
                     args = children[1:]
-            if len(args) > 4:
-                bad.append(f"call to '{callee_name}' with {len(args)} args (max 4 supported)")
+            total_slots = 0
+            for a in args:
+                if a.type.kind == ci.TypeKind.RECORD:
+                    fields = get_struct_fields(a.type.get_declaration())
+                    total_slots += len(fields) if fields else 1
+                else:
+                    total_slots += 1
+            if total_slots > 4:
+                bad.append(f"call to '{callee_name}' with {total_slots} argument slots (max 4 supported)")
                 return
 
         for c in node.get_children():
@@ -246,10 +287,20 @@ class BytecodeBuilder:
         self.code += bytes(args_padded[:4])
         self.code += bytes([r_dst])
 
+    def ret_struct(self, n_fields, field_regs):
+        r0 = field_regs[0] if len(field_regs) > 0 else 0xFF
+        r1 = field_regs[1] if len(field_regs) > 1 else 0xFF
+        r2 = field_regs[2] if len(field_regs) > 2 else 0xFF
+        r3 = field_regs[3] if len(field_regs) > 3 else 0xFF
+        self.code += bytes([OP_RET_STRUCT, n_fields, r0, r1, r2, r3])
+
+    def struct_ret_load(self, r_dst, field_idx):
+        self.code += bytes([OP_STRUCT_RET_LOAD, r_dst, field_idx])
+
 
 class FunctionCompiler:
     """Compiles one eligible function's AST into bytecode."""
-    def __init__(self, start_offset=0, func_entry_offsets=None):
+    def __init__(self, start_offset=0, func_entry_offsets=None, struct_names=None):
         self.start_offset = start_offset
         self.b = BytecodeBuilder(start_offset=start_offset)
         self.next_reg = 0
@@ -259,6 +310,7 @@ class FunctionCompiler:
         self.array_offsets = {}  # array name -> (base_offset, size)
         self.struct_offsets = {} # struct var name -> (base_offset, {field_name: field_index})
         self.func_entry_offsets = func_entry_offsets or {}  # callee name -> offset
+        self.struct_names = struct_names or set()
 
     def alloc_reg(self):
         r = self.next_reg
@@ -306,13 +358,61 @@ class FunctionCompiler:
             return base_offset + field_map[field_name]
         raise RuntimeError(f"unsupported member ref target: {child.kind}")
 
+    def unwrap_expr(self, node):
+        while True:
+            if node.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                children = list(node.get_children())
+                if children:
+                    node = children[0]
+                    continue
+            elif node.kind == ci.CursorKind.CALL_EXPR:
+                if node.spelling in self.func_entry_offsets:
+                    break  # Real function call - keep intact
+                if node.spelling in self.struct_names:
+                    children = list(node.get_children())
+                    if children:
+                        node = children[0]
+                        continue
+            break
+        return node
+
+    def _get_struct_fields(self, decl_cursor):
+        if hasattr(decl_cursor.type, 'get_fields'):
+            fields = list(decl_cursor.type.get_fields())
+            if fields: return fields
+        return [c for c in decl_cursor.get_children() if c.kind == ci.CursorKind.FIELD_DECL]
+
     def compile_function(self, func_cursor):
+        if not self.struct_names and hasattr(func_cursor, 'translation_unit') and func_cursor.translation_unit:
+            self.struct_names = {c.spelling for c in func_cursor.translation_unit.cursor.get_children()
+                                 if c.kind in (ci.CursorKind.STRUCT_DECL, ci.CursorKind.CLASS_DECL)}
+
+        self.result_type = func_cursor.result_type
         params = list(func_cursor.get_arguments())
-        for i, p in enumerate(params):
-            self.arg_index[p.spelling] = i
-            r = self.alloc_reg()
-            self.b.load_arg(r, i)
-            self.var_reg[p.spelling] = r
+        slot_idx = 0
+        for p in params:
+            if p.type.spelling == "int":
+                self.arg_index[p.spelling] = slot_idx
+                r = self.alloc_reg()
+                self.b.load_arg(r, slot_idx)
+                self.var_reg[p.spelling] = r
+                slot_idx += 1
+            elif p.type.kind == ci.TypeKind.RECORD:
+                decl = p.type.get_declaration()
+                fields = self._get_struct_fields(decl)
+                base_offset = self.next_mem_offset
+                field_map = {f.spelling: idx for idx, f in enumerate(fields)}
+                self.struct_offsets[p.spelling] = (base_offset, field_map)
+                self.next_mem_offset += len(fields)
+                for idx in range(len(fields)):
+                    r_arg = self.alloc_reg()
+                    self.b.load_arg(r_arg, slot_idx)
+                    r_zero = self.alloc_reg()
+                    self.b.load_const(r_zero, 0)
+                    field_mem_slot = base_offset + idx
+                    self.b.arr_store(field_mem_slot, r_zero, r_arg)
+                    self.free_scratch_regs()
+                    slot_idx += 1
 
         body = None
         for c in func_cursor.get_children():
@@ -360,12 +460,7 @@ class FunctionCompiler:
                         self.free_scratch_regs()
             elif node.type.kind == ci.TypeKind.RECORD:
                 decl = node.type.get_declaration()
-                if hasattr(decl.type, 'get_fields'):
-                    fields = list(decl.type.get_fields())
-                    if not fields:
-                        fields = [c for c in decl.get_children() if c.kind == ci.CursorKind.FIELD_DECL]
-                else:
-                    fields = [c for c in decl.get_children() if c.kind == ci.CursorKind.FIELD_DECL]
+                fields = self._get_struct_fields(decl)
                 size = len(fields)
                 if self.next_mem_offset + size > 256:
                     raise RuntimeError(f"struct memory overflow: allocated {self.next_mem_offset + size} > 256")
@@ -376,10 +471,15 @@ class FunctionCompiler:
 
                 children = list(node.get_children())
                 init_list = None
+                other_init = None
                 for c in children:
                     if c.kind == ci.CursorKind.INIT_LIST_EXPR:
                         init_list = c
                         break
+                    elif c.kind not in (ci.CursorKind.TYPE_REF, ci.CursorKind.STRUCT_DECL):
+                        if c.kind == ci.CursorKind.CALL_EXPR and c.spelling in self.struct_names and len(list(c.get_children())) == 0:
+                            continue
+                        other_init = c
                 if init_list:
                     init_exprs = list(init_list.get_children())
                     for idx, elem_expr in enumerate(init_exprs):
@@ -389,6 +489,28 @@ class FunctionCompiler:
                         field_mem_slot = base_offset + idx
                         self.b.arr_store(field_mem_slot, r_zero, val_reg)
                         self.free_scratch_regs()
+                elif other_init:
+                    unwrapped_init = self.unwrap_expr(other_init)
+                    if unwrapped_init.kind == ci.CursorKind.CALL_EXPR:
+                        self.compile_expr(unwrapped_init)
+                        for idx in range(size):
+                            r_val = self.alloc_reg()
+                            self.b.struct_ret_load(r_val, idx)
+                            r_zero = self.alloc_reg()
+                            self.b.load_const(r_zero, 0)
+                            self.b.arr_store(base_offset + idx, r_zero, r_val)
+                            self.free_scratch_regs()
+                    elif unwrapped_init.kind == ci.CursorKind.DECL_REF_EXPR and unwrapped_init.spelling in self.struct_offsets:
+                        src_base, _ = self.struct_offsets[unwrapped_init.spelling]
+                        for idx in range(size):
+                            r_val = self.alloc_reg()
+                            r_zero = self.alloc_reg()
+                            self.b.load_const(r_zero, 0)
+                            self.b.arr_load(r_val, src_base + idx, r_zero)
+                            r_zero2 = self.alloc_reg()
+                            self.b.load_const(r_zero2, 0)
+                            self.b.arr_store(base_offset + idx, r_zero2, r_val)
+                            self.free_scratch_regs()
             else:
                 children = list(node.get_children())
                 r = self.alloc_reg()
@@ -401,48 +523,47 @@ class FunctionCompiler:
         elif node.kind == ci.CursorKind.IF_STMT:
             children = list(node.get_children())
             cond = children[0]
-            then_branch = children[1]
-            else_branch = children[2] if len(children) > 2 else None
-            cond_reg = self.compile_expr(cond)
-            patch_true = self.b.jmp_if_true(cond_reg)
-            if else_branch:
-                self.compile_stmt(else_branch)
-            patch_skip_then = self.b.jmp()
-            then_target = self.b.here()
-            self.b.patch(patch_true, then_target)
-            self.compile_stmt(then_branch)
-            end_target = self.b.here()
-            self.b.patch(patch_skip_then, end_target)
+            then_body = children[1]
+            else_body = children[2] if len(children) > 2 else None
+
+            r_cond = self.compile_expr(cond)
+            patch_else = self.b.jmp_if_false(r_cond)
+            self.free_scratch_regs()
+
+            self.compile_stmt(then_body)
+            if else_body:
+                patch_exit = self.b.jmp()
+                else_target = self.b.here()
+                self.b.patch(patch_else, else_target)
+                self.compile_stmt(else_body)
+                exit_target = self.b.here()
+                self.b.patch(patch_exit, exit_target)
+            else:
+                exit_target = self.b.here()
+                self.b.patch(patch_else, exit_target)
 
         elif node.kind == ci.CursorKind.WHILE_STMT:
             children = list(node.get_children())
             cond = children[0]
             body = children[1]
+
             loop_start = self.b.here()
-            cond_reg = self.compile_expr(cond)
-            patch_exit = self.b.jmp_if_false(cond_reg)
+            r_cond = self.compile_expr(cond)
+            patch_exit = self.b.jmp_if_false(r_cond)
+            self.free_scratch_regs()
+
             self.compile_stmt(body)
             self.b.jmp_to(loop_start)
-            exit_target = self.b.here()
-            self.b.patch(patch_exit, exit_target)
+
+            loop_exit = self.b.here()
+            self.b.patch(patch_exit, loop_exit)
 
         elif node.kind == ci.CursorKind.FOR_STMT:
-            tokens = list(node.get_tokens())
-            semis = [t for t in tokens if t.spelling == ';'][:2]
-            semi1_start = semis[0].extent.start.offset if len(semis) > 0 else 0
-            semi2_start = semis[1].extent.start.offset if len(semis) > 1 else 0
-
             children = list(node.get_children())
-            body_node = children[-1]
-            init_node, cond_node, inc_node = None, None, None
-            for c in children[:-1]:
-                c_start = c.extent.start.offset
-                if c_start < semi1_start:
-                    init_node = c
-                elif semi1_start <= c_start < semi2_start:
-                    cond_node = c
-                elif c_start > semi2_start:
-                    inc_node = c
+            init_node = children[0] if len(children) > 0 else None
+            cond_node = children[1] if len(children) > 1 else None
+            inc_node = children[2] if len(children) > 2 else None
+            body_node = children[3] if len(children) > 3 else None
 
             if init_node:
                 self.compile_stmt(init_node)
@@ -450,8 +571,9 @@ class FunctionCompiler:
             loop_start = self.b.here()
             patch_exit = None
             if cond_node:
-                cond_reg = self.compile_expr(cond_node)
-                patch_exit = self.b.jmp_if_false(cond_reg)
+                r_cond = self.compile_expr(cond_node)
+                patch_exit = self.b.jmp_if_false(r_cond)
+                self.free_scratch_regs()
 
             self.compile_stmt(body_node)
 
@@ -468,14 +590,38 @@ class FunctionCompiler:
             if op_tok == '=':
                 children = list(node.get_children())
                 lhs, rhs = children[0], children[1]
-                r_src = self.compile_expr(rhs)
                 target = lhs
                 if target.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
                     target = list(target.get_children())[0]
-                if target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.var_reg:
+                if target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.struct_offsets:
+                    base_offset, field_map = self.struct_offsets[target.spelling]
+                    unwrapped_rhs = self.unwrap_expr(rhs)
+                    if unwrapped_rhs.kind == ci.CursorKind.CALL_EXPR:
+                        self.compile_expr(unwrapped_rhs)
+                        for idx in range(len(field_map)):
+                            r_val = self.alloc_reg()
+                            self.b.struct_ret_load(r_val, idx)
+                            r_zero = self.alloc_reg()
+                            self.b.load_const(r_zero, 0)
+                            self.b.arr_store(base_offset + idx, r_zero, r_val)
+                            self.free_scratch_regs()
+                    elif unwrapped_rhs.kind == ci.CursorKind.DECL_REF_EXPR and unwrapped_rhs.spelling in self.struct_offsets:
+                        src_base, _ = self.struct_offsets[unwrapped_rhs.spelling]
+                        for idx in range(len(field_map)):
+                            r_val = self.alloc_reg()
+                            r_zero = self.alloc_reg()
+                            self.b.load_const(r_zero, 0)
+                            self.b.arr_load(r_val, src_base + idx, r_zero)
+                            r_zero2 = self.alloc_reg()
+                            self.b.load_const(r_zero2, 0)
+                            self.b.arr_store(base_offset + idx, r_zero2, r_val)
+                            self.free_scratch_regs()
+                elif target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.var_reg:
+                    r_src = self.compile_expr(rhs)
                     r_dst = self.var_reg[target.spelling]
                     self.copy_reg(r_dst, r_src)
                 elif target.kind == ci.CursorKind.ARRAY_SUBSCRIPT_EXPR:
+                    r_src = self.compile_expr(rhs)
                     arr_name, idx_node = self.parse_array_subscript(target)
                     if arr_name not in self.array_offsets:
                         raise RuntimeError(f"unknown array identifier: {arr_name}")
@@ -483,6 +629,7 @@ class FunctionCompiler:
                     idx_reg = self.compile_expr(idx_node)
                     self.b.arr_store(base_offset, idx_reg, r_src)
                 elif target.kind == ci.CursorKind.MEMBER_REF_EXPR:
+                    r_src = self.compile_expr(rhs)
                     field_mem_slot = self.parse_member_ref(target)
                     r_zero = self.alloc_reg()
                     self.b.load_const(r_zero, 0)
@@ -548,13 +695,40 @@ class FunctionCompiler:
                 self.b.ret_const(0)
                 return
             expr = children[0]
-            if expr.kind == ci.CursorKind.INTEGER_LITERAL:
-                tokens = list(expr.get_tokens())
-                value = int(tokens[0].spelling) if tokens else 0
-                self.b.ret_const(value)
+            if hasattr(self, 'result_type') and self.result_type and self.result_type.kind == ci.TypeKind.RECORD:
+                decl = self.result_type.get_declaration()
+                fields = self._get_struct_fields(decl)
+                n_fields = len(fields)
+                unwrapped = self.unwrap_expr(expr)
+                field_regs = []
+                if unwrapped.kind == ci.CursorKind.DECL_REF_EXPR and unwrapped.spelling in self.struct_offsets:
+                    base_offset, field_map = self.struct_offsets[unwrapped.spelling]
+                    for idx in range(n_fields):
+                        r_f = self.alloc_reg()
+                        r_zero = self.alloc_reg()
+                        self.b.load_const(r_zero, 0)
+                        self.b.arr_load(r_f, base_offset + idx, r_zero)
+                        field_regs.append(r_f)
+                elif unwrapped.kind == ci.CursorKind.INIT_LIST_EXPR:
+                    for elem in unwrapped.get_children():
+                        field_regs.append(self.compile_expr(elem))
+                elif unwrapped.kind == ci.CursorKind.CALL_EXPR:
+                    self.compile_expr(unwrapped)
+                    for idx in range(n_fields):
+                        r_f = self.alloc_reg()
+                        self.b.struct_ret_load(r_f, idx)
+                        field_regs.append(r_f)
+                else:
+                    raise RuntimeError(f"unsupported return struct expression kind: {unwrapped.kind}")
+                self.b.ret_struct(n_fields, field_regs)
             else:
-                r = self.compile_expr(expr)
-                self.b.ret_reg(r)
+                if expr.kind == ci.CursorKind.INTEGER_LITERAL:
+                    tokens = list(expr.get_tokens())
+                    value = int(tokens[0].spelling) if tokens else 0
+                    self.b.ret_const(value)
+                else:
+                    r = self.compile_expr(expr)
+                    self.b.ret_reg(r)
         else:
             raise RuntimeError(f"unhandled statement kind: {node.kind}")
 
@@ -604,11 +778,10 @@ class FunctionCompiler:
 
         if node.kind == ci.CursorKind.MEMBER_REF_EXPR:
             field_mem_slot = self.parse_member_ref(node)
-            r_zero = self.alloc_reg()
-            self.b.load_const(r_zero, 0)
-            dst_reg = self.alloc_reg()
-            self.b.arr_load(dst_reg, field_mem_slot, r_zero)
-            return dst_reg
+            r = self.alloc_reg()
+            self.b.load_const(r, 0)
+            self.b.arr_load(r, field_mem_slot, r)
+            return r
 
         if node.kind == ci.CursorKind.CALL_EXPR:
             callee_name = node.spelling
@@ -620,15 +793,42 @@ class FunctionCompiler:
                 raise RuntimeError(f"unknown callee function: '{callee_name}'")
             callee_offset = self.func_entry_offsets[callee_name]
 
-            args = list(node.get_arguments())
-            if not args:
+            raw_args = list(node.get_arguments())
+            if not raw_args:
                 children = list(node.get_children())
                 if len(children) > 1:
-                    args = children[1:]
-            if len(args) > 4:
-                raise RuntimeError(f"call to '{callee_name}' has {len(args)} args (max 4 supported)")
+                    raw_args = children[1:]
 
-            arg_regs = [self.compile_expr(a) for a in args]
+            arg_regs = []
+            for a in raw_args:
+                unwrapped = self.unwrap_expr(a)
+                if unwrapped.kind == ci.CursorKind.DECL_REF_EXPR and unwrapped.spelling in self.struct_offsets:
+                    base_offset, field_map = self.struct_offsets[unwrapped.spelling]
+                    for idx in range(len(field_map)):
+                        r = self.alloc_reg()
+                        self.b.load_const(r, 0)
+                        self.b.arr_load(r, base_offset + idx, r)
+                        arg_regs.append(r)
+                elif unwrapped.type.kind == ci.TypeKind.RECORD:
+                    if unwrapped.kind == ci.CursorKind.INIT_LIST_EXPR:
+                        for elem in unwrapped.get_children():
+                            arg_regs.append(self.compile_expr(elem))
+                    elif unwrapped.kind == ci.CursorKind.CALL_EXPR:
+                        self.compile_expr(unwrapped)
+                        decl = unwrapped.type.get_declaration()
+                        fields = self._get_struct_fields(decl)
+                        for idx in range(len(fields)):
+                            r_f = self.alloc_reg()
+                            self.b.struct_ret_load(r_f, idx)
+                            arg_regs.append(r_f)
+                    else:
+                        raise RuntimeError(f"unsupported struct argument kind: {unwrapped.kind}")
+                else:
+                    arg_regs.append(self.compile_expr(a))
+
+            if len(arg_regs) > 4:
+                raise RuntimeError(f"call to '{callee_name}' has {len(arg_regs)} total arg slots (max 4 supported)")
+
             r_dst = self.alloc_reg()
             self.b.call(callee_offset, arg_regs, r_dst)
             return r_dst
@@ -639,9 +839,14 @@ class FunctionCompiler:
             op_token = self._binary_op_symbol(node)
             r_a = self.compile_expr(lhs)
             r_b = self.compile_expr(rhs)
-            r_dst = self.alloc_reg()
             opcode = BIN_OP_TO_OPCODE[op_token]
+            if r_a not in self.var_reg.values():
+                r_dst = r_a
+            else:
+                r_dst = self.alloc_reg()
             self.b.binop(opcode, r_dst, r_a, r_b)
+            if r_b > r_dst and r_b not in self.var_reg.values():
+                self.next_reg = r_b
             return r_dst
 
         raise RuntimeError(f"unhandled expression kind: {node.kind}")

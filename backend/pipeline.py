@@ -227,12 +227,17 @@ def stage_virtualize(ctx: PipelineContext) -> None:
             ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
 
     shared_bytecode = bytearray()
+    struct_names = set()
+    if ctx.tu:
+        struct_names = {c.spelling for c in ctx.tu.cursor.get_children()
+                        if c.kind in (ci.CursorKind.STRUCT_DECL, ci.CursorKind.CLASS_DECL)}
+
     func_entry_offsets = {f.spelling: 0 for f in int_funcs}
 
     # Phase 1: Pre-calculate entry offsets for all eligible int functions
     curr_offset = 0
     for f in int_funcs:
-        c_dummy = FunctionCompiler(start_offset=curr_offset, func_entry_offsets=func_entry_offsets)
+        c_dummy = FunctionCompiler(start_offset=curr_offset, func_entry_offsets=func_entry_offsets, struct_names=struct_names)
         bc_dummy = c_dummy.compile_function(f)
         func_entry_offsets[f.spelling] = curr_offset
         curr_offset += len(bc_dummy)
@@ -241,7 +246,7 @@ def stage_virtualize(ctx: PipelineContext) -> None:
     for f in int_funcs:
         try:
             offset = func_entry_offsets[f.spelling]
-            compiler = FunctionCompiler(start_offset=offset, func_entry_offsets=func_entry_offsets)
+            compiler = FunctionCompiler(start_offset=offset, func_entry_offsets=func_entry_offsets, struct_names=struct_names)
             bc = compiler.compile_function(f)
             shared_bytecode.extend(bc)
             ctx.eligible_funcs.append((f, offset))
@@ -783,6 +788,20 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
                     f"}}\n\n"
                 )
 
+    from codegen import collect_top_level_type_decls
+
+    type_decl_texts = []
+    if ctx.tu:
+        type_decls = collect_top_level_type_decls(ctx.tu, ctx.filename)
+        with open(ctx.filename) as file_obj:
+            source_file_text = file_obj.read()
+        for td in type_decls:
+            start, end = td.extent.start.offset, td.extent.end.offset
+            txt = source_file_text[start:end].strip()
+            if not txt.endswith(";"):
+                txt += ";"
+            type_decl_texts.append(txt)
+
     output_parts = [
         "// ================================================================\n"
         "// Auto-generated obfuscated output.\n"
@@ -791,6 +810,7 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
         "// with local identifiers renamed.\n"
         "// ================================================================\n",
         "\n".join(ctx.include_lines) + "\n\n" if ctx.include_lines else "",
+        "\n\n".join(type_decl_texts) + "\n\n" if type_decl_texts else "",
         generate_vm_runtime(ctx.opcode_shuffle_map),
     ]
 
@@ -803,16 +823,55 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
         shared_bc = ctx.artifacts["shared_bytecode"]
         arr_name = random_name("shared_bc_")
         output_parts.append(bytes_to_c_array(arr_name, shared_bc))
+        def get_struct_fields_pipeline(decl_cursor):
+            if hasattr(decl_cursor.type, 'get_fields'):
+                fields = list(decl_cursor.type.get_fields())
+                if fields: return fields
+            return [c for c in decl_cursor.get_children() if c.kind == ci.CursorKind.FIELD_DECL]
+
         for f, offset in ctx.eligible_funcs:
             params = list(f.get_arguments())
-            param_list = ", ".join(f"int {p.spelling}" for p in params)
-            args_init = ", ".join(f"(int64_t){p.spelling}" for p in params)
-            output_parts.append(
-                f"int {f.spelling}({param_list}) {{\n"
-                f"    int64_t __args[] = {{ {args_init} }};\n"
-                f"    return (int)vm_rt::run({arr_name}, {arr_name}_len, __args, {len(params)}, {offset}, {checksum_str});\n"
-                f"}}\n\n"
-            )
+            param_list_parts = []
+            args_init_parts = []
+            for p in params:
+                param_list_parts.append(f"{p.type.spelling} {p.spelling}")
+                if p.type.spelling == "int":
+                    args_init_parts.append(f"(int64_t){p.spelling}")
+                elif p.type.kind == ci.TypeKind.RECORD:
+                    decl = p.type.get_declaration()
+                    fields = get_struct_fields_pipeline(decl)
+                    for f_item in fields:
+                        args_init_parts.append(f"(int64_t){p.spelling}.{f_item.spelling}")
+            param_list = ", ".join(param_list_parts)
+            args_init = ", ".join(args_init_parts)
+            total_slots = len(args_init_parts)
+
+            ret_type = f.result_type
+            if ret_type.spelling == "int":
+                output_parts.append(
+                    f"int {f.spelling}({param_list}) {{\n"
+                    f"    int64_t __args[] = {{ {args_init} }};\n"
+                    f"    return (int)vm_rt::run({arr_name}, {arr_name}_len, __args, {total_slots}, {offset}, {checksum_str});\n"
+                    f"}}\n\n"
+                )
+            elif ret_type.kind == ci.TypeKind.RECORD:
+                decl = ret_type.get_declaration()
+                fields = get_struct_fields_pipeline(decl)
+                n_fields = len(fields)
+                field_assignments = []
+                for idx, f_item in enumerate(fields):
+                    field_assignments.append(f"    __res.{f_item.spelling} = ({f_item.type.spelling})__ret[{idx}];")
+                assign_block = "\n".join(field_assignments)
+                output_parts.append(
+                    f"{ret_type.spelling} {f.spelling}({param_list}) {{\n"
+                    f"    int64_t __args[] = {{ {args_init} }};\n"
+                    f"    int64_t __ret[{n_fields}] = {{0}};\n"
+                    f"    vm_rt::run_struct({arr_name}, {arr_name}_len, __args, {total_slots}, {offset}, {checksum_str}, __ret, {n_fields});\n"
+                    f"    {ret_type.spelling} __res;\n"
+                    f"{assign_block}\n"
+                    f"    return __res;\n"
+                    f"}}\n\n"
+                )
 
     if str_vm_parts:
         output_parts.append("\n// ---- String VM functions ----\n")
