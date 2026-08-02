@@ -430,6 +430,137 @@ def stage_encrypt_strings(ctx: PipelineContext) -> None:
         ctx.artifacts[f"{func.spelling}_obfuscated_text"] = obfuscated_text
 
 
+def stage_flatten_control_flow(ctx: PipelineContext) -> None:
+    """Restructures qualifying fallback functions (>= 4 top-level statements, no early return)
+    into a randomized switch-inside-while(true) state machine dispatcher. Lifts variable
+    declarations to the outer block scope so switch case state transitions compile cleanly."""
+    from codegen import random_name
+
+    if not ctx.fallback_funcs:
+        return
+
+    with open(ctx.filename) as f:
+        original_text = f.read()
+
+    for func in ctx.fallback_funcs:
+        obf_key = f"{func.spelling}_obfuscated_text"
+        body = next((c for c in func.get_children() if c.kind == ci.CursorKind.COMPOUND_STMT), None)
+        if body is None:
+            continue
+
+        stmts = list(body.get_children())
+
+        # Threshold check: >= 4 top-level statements required
+        if len(stmts) < 4:
+            continue
+
+        # Early return check: no return statement in stmts[:-1]
+        has_early_return = False
+        for s in stmts[:-1]:
+            for n in s.walk_preorder():
+                if n.kind == ci.CursorKind.RETURN_STMT:
+                    has_early_return = True
+                    break
+            if has_early_return:
+                break
+        if has_early_return:
+            continue
+
+        func_start = func.extent.start.offset
+        body_start = body.extent.start.offset
+        header_text = original_text[func_start:body_start]
+        for old, new in ctx.rename_map.items():
+            header_text = re.sub(rf"\b{re.escape(old)}\b", new, header_text)
+
+        func_replacements = ctx.func_replacements.get(func, [])
+        lifted_decls = []
+        stmt_texts = []
+        unsupported = False
+
+        for s in stmts:
+            s_rel_start = s.extent.start.offset - func_start
+            s_rel_end = s.extent.end.offset - func_start
+            s_text_raw = original_text[s.extent.start.offset:s.extent.end.offset]
+
+            # Collect replacements for s (which were recorded relative to func_start)
+            s_repls = [(r[0] - s_rel_start, r[1] - s_rel_start, r[2]) for r in func_replacements if s_rel_start <= r[0] < r[1] <= s_rel_end]
+            s_repls.sort(key=lambda x: x[0])
+
+            pieces = []
+            last_pos = 0
+            for r_start_rel, r_end_rel, obf_expr in s_repls:
+                pieces.append(s_text_raw[last_pos:r_start_rel])
+                pieces.append(obf_expr)
+                last_pos = r_end_rel
+            pieces.append(s_text_raw[last_pos:])
+            s_text = "".join(pieces).strip()
+
+            if s.kind == ci.CursorKind.DECL_STMT:
+                var_decls = [c for c in s.get_children() if c.kind == ci.CursorKind.VAR_DECL]
+                if len(var_decls) > 1:
+                    unsupported = True
+                    break
+                for child in var_decls:
+                    type_spelling = child.type.spelling
+                    if "[" in type_spelling or child.type.kind in (ci.TypeKind.CONSTANTARRAY, ci.TypeKind.INCOMPLETEARRAY, ci.TypeKind.VARIABLEARRAY):
+                        unsupported = True
+                        break
+                    if any(t in type_spelling for t in ("int", "long", "short", "char", "float", "double", "bool", "*", "size_t")):
+                        var_name = ctx.rename_map.get(child.spelling, child.spelling)
+                        lifted_decls.append(f"{type_spelling} {var_name};")
+                        s_text = re.sub(rf"^.*?\b{re.escape(child.spelling)}\b", var_name, s_text)
+                    else:
+                        unsupported = True
+                        break
+                if unsupported:
+                    break
+
+            # Apply identifier renaming to statement text
+            for old, new in ctx.rename_map.items():
+                s_text = re.sub(rf"\b{re.escape(old)}\b", new, s_text)
+
+            stmt_texts.append(s_text)
+
+        if unsupported:
+            continue
+
+        num_stmts = len(stmt_texts)
+        case_labels = random.sample(range(10, 99), num_stmts)
+        start_label = case_labels[0]
+        state_var = random_name("cf_state_")
+
+        case_blocks = []
+        for i in range(num_stmts):
+            label = case_labels[i]
+            next_label = case_labels[i + 1] if i < num_stmts - 1 else -1
+            stmt_t = stmt_texts[i]
+            if not stmt_t.endswith(";"):
+                stmt_t += ";"
+            block = f"            case {label}:\n                {stmt_t}\n                {state_var} = {next_label};\n                continue;"
+            case_blocks.append(block)
+
+        random.shuffle(case_blocks)
+        cases_str = "\n".join(case_blocks)
+
+        lifted_str = "\n    ".join(lifted_decls)
+        if lifted_str:
+            lifted_str = "\n    " + lifted_str
+
+        flattened_body = f""" {{
+{lifted_str}
+    int {state_var} = {start_label};
+    while (true) {{
+        switch ({state_var}) {{
+{cases_str}
+        }}
+        break;
+    }}
+}}"""
+
+        new_func_text = header_text + flattened_body
+        ctx.artifacts[obf_key] = new_func_text
+
+
 def stage_assemble_output(ctx: PipelineContext) -> None:
     from codegen import random_name, bytes_to_c_array, generate_vm_runtime
 
@@ -494,6 +625,7 @@ PIPELINE_STAGES = [
     stage_rename_fallback,
     stage_obfuscate_literals,
     stage_encrypt_strings,
+    stage_flatten_control_flow,
     stage_assemble_output,
 ]
 
