@@ -165,77 +165,74 @@ def stage_parse(ctx: PipelineContext) -> None:
 def stage_eligibility_check(ctx: PipelineContext) -> None:
     from bytecode_gen import string_function_eligibility_check
 
-    # Pass 1: Identify all leaf eligible functions (no CALL_EXPR nodes)
-    known_leaf_names = set()
+    all_func_names = {f.spelling for f in ctx.funcs}
+    eligible_set = set()
+
+    # Pass 1: Check basic construct eligibility for all functions
     for f in ctx.funcs:
-        ok, reason = eligibility_check(f, known_leaf_functions=set())
+        ok, reason = eligibility_check(f, all_func_names=all_func_names)
         if ok:
             body = next((c for c in f.get_children()
                          if c.kind == ci.CursorKind.COMPOUND_STMT), None)
             if body is not None and len(list(body.get_children())) == 0:
                 ok, reason = False, "function body parsed as empty (likely a parse issue, not real code)"
             else:
-                known_leaf_names.add(f.spelling)
+                eligible_set.add(f.spelling)
         elif string_function_eligibility_check(f):
             ok, reason = True, "eligible (string VM)"
         ctx.treatments[f] = (ok, reason)
 
-    # Pass 2: Identify caller functions that call only known leaf functions
-    for f in ctx.funcs:
-        if not ctx.treatments[f][0]:
-            ok, reason = eligibility_check(f, known_leaf_functions=known_leaf_names)
-            if ok:
-                body = next((c for c in f.get_children()
-                             if c.kind == ci.CursorKind.COMPOUND_STMT), None)
-                if body is not None and len(list(body.get_children())) == 0:
-                    ok, reason = False, "function body parsed as empty (likely a parse issue, not real code)"
-                else:
-                    ctx.treatments[f] = (True, "eligible (caller)")
+    # Pass 2: Prune functions that call a callee that is NOT in the eligible set
+    changed = True
+    while changed:
+        changed = False
+        for f in ctx.funcs:
+            if ctx.treatments[f][0] and "string VM" not in ctx.treatments[f][1]:
+                for node in f.walk_preorder():
+                    if node.kind == ci.CursorKind.CALL_EXPR:
+                        callee_name = node.spelling
+                        if not callee_name:
+                            children = list(node.get_children())
+                            if children:
+                                callee_name = children[0].spelling
+                        if callee_name and callee_name not in eligible_set:
+                            ctx.treatments[f] = (False, f"calls non-virtualized function '{callee_name}'")
+                            eligible_set.remove(f.spelling)
+                            changed = True
+                            break
 
 
 def stage_virtualize(ctx: PipelineContext) -> None:
-    from bytecode_gen import StringFunctionCompiler
+    from bytecode_gen import StringFunctionCompiler, FunctionCompiler
 
-    leaf_funcs = []
-    caller_funcs = []
+    int_funcs = []
     str_funcs = []
     for f in ctx.funcs:
         ok, reason = ctx.treatments.get(f, (False, "unknown"))
         if ok:
             if "string VM" in reason:
                 str_funcs.append(f)
-            elif "caller" in reason:
-                caller_funcs.append(f)
             else:
-                leaf_funcs.append(f)
+                int_funcs.append(f)
         else:
             ctx.fallback_funcs.append(f)
             ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
 
     shared_bytecode = bytearray()
-    func_entry_offsets = {}
+    func_entry_offsets = {f.spelling: 0 for f in int_funcs}
 
-    # Compile leaf functions first to establish their entry offsets
-    for f in leaf_funcs:
-        try:
-            offset = len(shared_bytecode)
-            func_entry_offsets[f.spelling] = offset
-            compiler = FunctionCompiler(start_offset=offset, func_entry_offsets=func_entry_offsets)
-            bc = compiler.compile_function(f)
-            shared_bytecode.extend(bc)
-            ctx.eligible_funcs.append((f, offset))
-            ctx.artifacts[f.spelling] = bc
-            ctx.report.append(f"{f.spelling}: VIRTUALIZED ({len(bc)} bytes of bytecode)")
-        except Exception as e:
-            reason = f"codegen failed: {e}"
-            ctx.fallback_funcs.append(f)
-            ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
+    # Phase 1: Pre-calculate entry offsets for all eligible int functions
+    curr_offset = 0
+    for f in int_funcs:
+        c_dummy = FunctionCompiler(start_offset=curr_offset, func_entry_offsets=func_entry_offsets)
+        bc_dummy = c_dummy.compile_function(f)
+        func_entry_offsets[f.spelling] = curr_offset
+        curr_offset += len(bc_dummy)
 
-    # Compile caller functions next using the established leaf offsets
-    for f in caller_funcs:
+    # Phase 2: Final compile with complete func_entry_offsets (handles forward calls, mutual recursion, self-recursion)
+    for f in int_funcs:
         try:
-            offset = len(shared_bytecode)
-            func_entry_offsets[f.spelling] = offset
+            offset = func_entry_offsets[f.spelling]
             compiler = FunctionCompiler(start_offset=offset, func_entry_offsets=func_entry_offsets)
             bc = compiler.compile_function(f)
             shared_bytecode.extend(bc)

@@ -98,13 +98,15 @@ ALLOWED_KINDS = {
 }
 
 
-def eligibility_check(func_cursor, known_leaf_functions=None):
+def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=None):
     """Returns (True, reason) if this function can be fully virtualized,
     (False, reason) otherwise. Only allows: int params, int locals,
     fixed-size int arrays, arithmetic, comparisons, loops, if/return,
-    and single-level calls to known leaf functions."""
-    if known_leaf_functions is None:
-        known_leaf_functions = set()
+    and calls (including recursive / multi-level) with <= 4 args to functions defined in the source."""
+    if known_leaf_functions is not None and all_func_names is None:
+        allowed_callees = known_leaf_functions
+    else:
+        allowed_callees = all_func_names
 
     # All parameters and the return type must be int
     if func_cursor.result_type.spelling not in ("int",):
@@ -133,10 +135,7 @@ def eligibility_check(func_cursor, known_leaf_functions=None):
                 children = list(node.get_children())
                 if children:
                     callee_name = children[0].spelling
-            if callee_name == func_cursor.spelling:
-                bad.append(f"recursive call to '{callee_name}'")
-                return
-            if callee_name not in known_leaf_functions:
+            if allowed_callees is not None and callee_name not in allowed_callees:
                 bad.append(f"call to non-leaf/unknown function '{callee_name}'")
                 return
             args = list(node.get_arguments())

@@ -337,25 +337,22 @@ int callFive(int x) {
     tu = index.parse(tmp_path, args=["-std=c++17"] + _macos_clang_args())
     funcs = {cur.spelling: cur for cur in tu.cursor.get_children() if cur.kind == ci.CursorKind.FUNCTION_DECL}
 
-    # 1. Recursion
-    el_rec, r_rec = eligibility_check(funcs["recurse"], known_leaf_functions={"recurse"})
-    assert not el_rec, "Recursion should be ineligible"
-    assert "recursive" in r_rec.lower(), f"Unexpected reason: {r_rec}"
+    # 1. Recursion (now supported)
+    el_rec, r_rec = eligibility_check(funcs["recurse"], all_func_names={"recurse"})
+    assert el_rec, f"Recursion should now be eligible: {r_rec}"
 
-    # 2. 2-level chain: leaf passes Pass 1, mid passes Pass 2, topChain fails Pass 2 because mid is not a leaf
-    el_leaf, _ = eligibility_check(funcs["leaf"], known_leaf_functions=set())
+    # 2. Multi-level call chain (now supported)
+    el_leaf, _ = eligibility_check(funcs["leaf"], all_func_names={"leaf", "mid", "topChain"})
     assert el_leaf
 
-    el_mid, _ = eligibility_check(funcs["mid"], known_leaf_functions={"leaf"})
+    el_mid, _ = eligibility_check(funcs["mid"], all_func_names={"leaf", "mid", "topChain"})
     assert el_mid
 
-    # Pass 2 known_leaf_functions only contains Pass 1 winners ("leaf", not "mid")
-    el_top, r_top = eligibility_check(funcs["topChain"], known_leaf_functions={"leaf"})
-    assert not el_top, "2-level call chain should be ineligible"
-    assert "non-leaf" in r_top.lower() or "unknown" in r_top.lower(), f"Unexpected reason: {r_top}"
+    el_top, r_top = eligibility_check(funcs["topChain"], all_func_names={"leaf", "mid", "topChain"})
+    assert el_top, f"Multi-level call chain should now be eligible: {r_top}"
 
-    # 3. Call with 5 args
-    el_5, r_5 = eligibility_check(funcs["callFive"], known_leaf_functions={"takeFive"})
+    # 3. Call with 5 args (still ineligible, max 4 supported)
+    el_5, r_5 = eligibility_check(funcs["callFive"], all_func_names={"takeFive", "callFive"})
     assert not el_5, "Call with > 4 args should be ineligible"
     assert "5 args" in r_5.lower() or "max 4" in r_5.lower(), f"Unexpected reason: {r_5}"
 
