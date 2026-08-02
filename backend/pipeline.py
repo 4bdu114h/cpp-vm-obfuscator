@@ -21,6 +21,7 @@ class PipelineContext:
     treatments: Dict[Any, Tuple[bool, str]] = field(default_factory=dict)
     artifacts: Dict[str, Any] = field(default_factory=dict)
     eligible_funcs: List[Tuple[Any, bytes]] = field(default_factory=list)
+    eligible_str_funcs: List[Tuple[Any, bytes, List[str]]] = field(default_factory=list)
     fallback_funcs: List[Any] = field(default_factory=list)
     rename_map: Dict[str, str] = field(default_factory=dict)
     opcode_shuffle_map: Dict[int, int] = field(default_factory=dict)
@@ -162,6 +163,8 @@ def stage_parse(ctx: PipelineContext) -> None:
 
 
 def stage_eligibility_check(ctx: PipelineContext) -> None:
+    from bytecode_gen import string_function_eligibility_check
+
     # Pass 1: Identify all leaf eligible functions (no CALL_EXPR nodes)
     known_leaf_names = set()
     for f in ctx.funcs:
@@ -173,6 +176,8 @@ def stage_eligibility_check(ctx: PipelineContext) -> None:
                 ok, reason = False, "function body parsed as empty (likely a parse issue, not real code)"
             else:
                 known_leaf_names.add(f.spelling)
+        elif string_function_eligibility_check(f):
+            ok, reason = True, "eligible (string VM)"
         ctx.treatments[f] = (ok, reason)
 
     # Pass 2: Identify caller functions that call only known leaf functions
@@ -189,12 +194,17 @@ def stage_eligibility_check(ctx: PipelineContext) -> None:
 
 
 def stage_virtualize(ctx: PipelineContext) -> None:
+    from bytecode_gen import StringFunctionCompiler
+
     leaf_funcs = []
     caller_funcs = []
+    str_funcs = []
     for f in ctx.funcs:
         ok, reason = ctx.treatments.get(f, (False, "unknown"))
         if ok:
-            if "caller" in reason:
+            if "string VM" in reason:
+                str_funcs.append(f)
+            elif "caller" in reason:
                 caller_funcs.append(f)
             else:
                 leaf_funcs.append(f)
@@ -237,17 +247,40 @@ def stage_virtualize(ctx: PipelineContext) -> None:
             ctx.fallback_funcs.append(f)
             ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
 
+    # Compile string functions
+    for f in str_funcs:
+        try:
+            compiler = StringFunctionCompiler(f)
+            bc, const_pool = compiler.compile()
+            ctx.eligible_str_funcs.append((f, bc, const_pool))
+            ctx.artifacts[f.spelling] = bc
+            ctx.report.append(f"{f.spelling}: VIRTUALIZED STRING VM ({len(bc)} bytes of bytecode)")
+        except Exception as e:
+            reason = f"codegen failed: {e}"
+            ctx.fallback_funcs.append(f)
+            ctx.report.append(f"{f.spelling}: NOT virtualized ({reason}) - identifiers renamed instead")
+
     ctx.artifacts["shared_bytecode"] = bytes(shared_bytecode)
     ctx.func_entry_offsets = func_entry_offsets
 
 
+
 def stage_shuffle_opcodes(ctx: PipelineContext) -> None:
-    if not ctx.eligible_funcs:
+    if not ctx.eligible_funcs and not ctx.eligible_str_funcs:
         return
     ctx.opcode_shuffle_map = generate_opcode_shuffle()
-    shared_bc = ctx.artifacts["shared_bytecode"]
-    shuffled_shared_bc = apply_opcode_shuffle(shared_bc, ctx.opcode_shuffle_map)
-    ctx.artifacts["shared_bytecode"] = shuffled_shared_bc
+    if ctx.eligible_funcs:
+        shared_bc = ctx.artifacts["shared_bytecode"]
+        shuffled_shared_bc = apply_opcode_shuffle(shared_bc, ctx.opcode_shuffle_map)
+        ctx.artifacts["shared_bytecode"] = shuffled_shared_bc
+
+    if ctx.eligible_str_funcs:
+        new_str_funcs = []
+        for f, bc, pool in ctx.eligible_str_funcs:
+            shuffled_bc = apply_opcode_shuffle(bc, ctx.opcode_shuffle_map)
+            new_str_funcs.append((f, shuffled_bc, pool))
+            ctx.artifacts[f.spelling] = shuffled_bc
+        ctx.eligible_str_funcs = new_str_funcs
 
 
 def fnv1a_32(data: bytes) -> int:
@@ -259,11 +292,14 @@ def fnv1a_32(data: bytes) -> int:
 
 
 def stage_compute_bytecode_checksum(ctx: PipelineContext) -> None:
-    if not ctx.eligible_funcs:
+    if not ctx.eligible_funcs and not ctx.eligible_str_funcs:
         return
-    shared_bc = ctx.artifacts.get("shared_bytecode", b"")
-    checksum = fnv1a_32(shared_bc)
-    ctx.artifacts["bytecode_checksum"] = checksum
+    if ctx.eligible_funcs:
+        shared_bc = ctx.artifacts.get("shared_bytecode", b"")
+        ctx.artifacts["bytecode_checksum"] = fnv1a_32(shared_bc)
+
+    for f, bc, _ in ctx.eligible_str_funcs:
+        ctx.artifacts[f"checksum_{f.spelling}"] = fnv1a_32(bc)
 
 
 def stage_rename_fallback(ctx: PipelineContext) -> None:
@@ -525,7 +561,8 @@ def stage_flatten_control_flow(ctx: PipelineContext) -> None:
             continue
 
         num_stmts = len(stmt_texts)
-        case_labels = random.sample(range(10, 99), num_stmts)
+        label_pool = [x for x in range(10, 99) if x not in (50, 100)]
+        case_labels = random.sample(label_pool, num_stmts)
         start_label = case_labels[0]
         state_var = random_name("cf_state_")
 
@@ -719,6 +756,48 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
                 f"    return (int)vm_rt::run({arr_name}, {arr_name}_len, __args, {len(params)}, {offset}, {checksum_str});\n"
                 f"}}\n\n"
             )
+
+    if ctx.eligible_str_funcs:
+        output_parts.append("\n// ---- String VM functions ----\n")
+        def c_str_lit(s: str) -> str:
+            esc = s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+            return f'"{esc}"'
+
+        for f, bc, const_pool in ctx.eligible_str_funcs:
+            bc_arr_name = random_name(f"bc_str_{f.spelling}_")
+            pool_arr_name = random_name(f"pool_str_{f.spelling}_")
+            output_parts.append(bytes_to_c_array(bc_arr_name, bc))
+
+            pool_lits = ", ".join(c_str_lit(s) for s in const_pool)
+            output_parts.append(
+                f"static const std::string {pool_arr_name}[] = {{ {pool_lits} }};\n"
+                f"static const size_t {pool_arr_name}_len = {len(const_pool)};\n\n"
+            )
+
+            params = list(f.get_arguments())
+            param_list = ", ".join(f"{p.type.spelling} {p.spelling}" for p in params)
+            args_init = ", ".join(p.spelling for p in params)
+
+            str_checksum = ctx.artifacts.get(f"checksum_{f.spelling}", 0)
+            str_checksum_str = f"0x{str_checksum:08x}u"
+
+            ret_spelling = f.result_type.spelling
+            if "string" in ret_spelling or "basic_string" in ret_spelling:
+                output_parts.append(
+                    f"{ret_spelling} {f.spelling}({param_list}) {{\n"
+                    f"    std::string __args[] = {{ {args_init} }};\n"
+                    f"    return vm_rt::run_str({bc_arr_name}, {bc_arr_name}_len, __args, {len(params)}, {pool_arr_name}, {pool_arr_name}_len, nullptr, {str_checksum_str});\n"
+                    f"}}\n\n"
+                )
+            else:
+                output_parts.append(
+                    f"{ret_spelling} {f.spelling}({param_list}) {{\n"
+                    f"    std::string __args[] = {{ {args_init} }};\n"
+                    f"    int64_t __res = 0;\n"
+                    f"    vm_rt::run_str({bc_arr_name}, {bc_arr_name}_len, __args, {len(params)}, {pool_arr_name}, {pool_arr_name}_len, &__res, {str_checksum_str});\n"
+                    f"    return ({ret_spelling})__res;\n"
+                    f"}}\n\n"
+                )
 
     if ctx.fallback_funcs:
         output_parts.append("\n// ---- Renamed (non-virtualized) functions ----\n")

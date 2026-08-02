@@ -35,6 +35,13 @@ OP_HALT = 0x14
 OP_ARR_LOAD = 0x15
 OP_ARR_STORE = 0x16
 OP_CALL = 0x17
+OP_STR_LOAD_ARG = 0x18
+OP_STR_LOAD_CONST = 0x19
+OP_STR_CONCAT = 0x1A
+OP_STR_EQ = 0x1B
+OP_STR_NE = 0x1C
+OP_RET_STR = 0x1D
+OP_RET_STR_INT = 0x1E
 
 BIN_OP_TO_OPCODE = {
     '+': OP_ADD, '-': OP_SUB, '*': OP_MUL, '/': OP_DIV, '%': OP_MOD,
@@ -66,6 +73,13 @@ OPCODE_OPERAND_WIDTHS = {
     OP_ARR_LOAD: 3,
     OP_ARR_STORE: 3,
     OP_CALL: 7,
+    OP_STR_LOAD_ARG: 2,
+    OP_STR_LOAD_CONST: 2,
+    OP_STR_CONCAT: 3,
+    OP_STR_EQ: 3,
+    OP_STR_NE: 3,
+    OP_RET_STR: 1,
+    OP_RET_STR_INT: 1,
 }
 
 ALL_OPCODES = list(OPCODE_OPERAND_WIDTHS.keys())
@@ -532,3 +546,173 @@ class FunctionCompiler:
             if tok.spelling in BIN_OP_TO_OPCODE or tok.spelling == '=':
                 return tok.spelling
         raise RuntimeError("could not determine binary operator")
+
+
+def is_string_type(type_spelling: str) -> bool:
+    """Checks if a C++ type spelling is std::string."""
+    return "string" in type_spelling or "basic_string" in type_spelling
+
+
+def string_function_eligibility_check(func_cursor) -> bool:
+    """Checks if a function qualifies for std::string VM virtualization:
+    - All parameters are std::string.
+    - Return type is std::string, bool, or int.
+    - Body is a single RETURN_STMT containing string concatenation (+),
+      equality comparison (==), or inequality comparison (!=)."""
+    if func_cursor.kind != ci.CursorKind.FUNCTION_DECL:
+        return False
+
+    params = list(func_cursor.get_arguments())
+    if not params:
+        return False
+
+    for p in params:
+        if not is_string_type(p.type.spelling):
+            return False
+
+    ret_type = func_cursor.result_type.spelling
+    if not (is_string_type(ret_type) or ret_type in ("bool", "_Bool", "int", "int64_t")):
+        return False
+
+    body = next((c for c in func_cursor.get_children() if c.kind == ci.CursorKind.COMPOUND_STMT), None)
+    if body is None:
+        return False
+
+    stmts = list(body.get_children())
+    if len(stmts) != 1 or stmts[0].kind != ci.CursorKind.RETURN_STMT:
+        return False
+
+    allowed_kinds = {
+        ci.CursorKind.RETURN_STMT, ci.CursorKind.CALL_EXPR, ci.CursorKind.BINARY_OPERATOR,
+        ci.CursorKind.DECL_REF_EXPR, ci.CursorKind.STRING_LITERAL, ci.CursorKind.UNEXPOSED_EXPR,
+        ci.CursorKind.PAREN_EXPR
+    }
+
+    for n in stmts[0].walk_preorder():
+        if n.kind not in allowed_kinds:
+            return False
+        if n.kind in (ci.CursorKind.CALL_EXPR, ci.CursorKind.BINARY_OPERATOR):
+            sp = n.spelling
+            if sp and not any(op in sp for op in ("operator+", "operator==", "operator!=", "+", "==", "!=")):
+                return False
+
+    return True
+
+
+class StringFunctionCompiler:
+    """Compiles eligible std::string functions into string VM bytecode and string constant pools."""
+
+    def __init__(self, func_cursor):
+        self.func = func_cursor
+        self.params = {p.spelling: idx for idx, p in enumerate(func_cursor.get_arguments())}
+        self.const_pool = []
+        self.const_map = {}
+        self.bytecode = bytearray()
+        self.next_str_reg = 0
+        self.next_int_reg = 0
+
+    def alloc_str_reg(self) -> int:
+        r = self.next_str_reg
+        self.next_str_reg += 1
+        if self.next_str_reg > 16:
+            raise RuntimeError("Ran out of string registers (max 16)")
+        return r
+
+    def get_const_idx(self, s_val: str) -> int:
+        if s_val not in self.const_map:
+            idx = len(self.const_pool)
+            self.const_pool.append(s_val)
+            self.const_map[s_val] = idx
+        return self.const_map[s_val]
+
+    def compile(self):
+        body = next(c for c in self.func.get_children() if c.kind == ci.CursorKind.COMPOUND_STMT)
+        ret_stmt = next(c for c in body.get_children() if c.kind == ci.CursorKind.RETURN_STMT)
+        expr = list(ret_stmt.get_children())[0]
+        res_kind, res_reg = self._compile_expr(expr)
+
+        if res_kind == "string":
+            self.bytecode.append(OP_RET_STR)
+            self.bytecode.append(res_reg)
+        else:
+            self.bytecode.append(OP_RET_STR_INT)
+            self.bytecode.append(res_reg)
+
+        return bytes(self.bytecode), self.const_pool
+
+    def _compile_expr(self, node):
+        while node.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+            children = list(node.get_children())
+            if not children:
+                break
+            if len(children) == 1 and children[0].kind == ci.CursorKind.DECL_REF_EXPR and "operator" in children[0].spelling:
+                break
+            node = children[0]
+
+        if node.kind == ci.CursorKind.DECL_REF_EXPR and node.spelling in self.params:
+            arg_idx = self.params[node.spelling]
+            reg = self.alloc_str_reg()
+            self.bytecode.append(OP_STR_LOAD_ARG)
+            self.bytecode.append(reg)
+            self.bytecode.append(arg_idx)
+            return "string", reg
+
+        elif node.kind == ci.CursorKind.STRING_LITERAL:
+            raw_spelling = node.spelling
+            from pipeline import decode_cpp_string_literal
+            unescaped_bytes = decode_cpp_string_literal(raw_spelling)
+            unescaped_str = unescaped_bytes.decode("utf-8", errors="replace")
+            const_idx = self.get_const_idx(unescaped_str)
+            reg = self.alloc_str_reg()
+            self.bytecode.append(OP_STR_LOAD_CONST)
+            self.bytecode.append(reg)
+            self.bytecode.append(const_idx)
+            return "string", reg
+
+        elif node.kind in (ci.CursorKind.CALL_EXPR, ci.CursorKind.BINARY_OPERATOR):
+            sp = node.spelling
+            children = list(node.get_children())
+
+            is_concat = "operator+" in sp or sp == "+" or any(t.spelling == "+" for t in node.get_tokens())
+            is_eq = "operator==" in sp or sp == "==" or any(t.spelling == "==" for t in node.get_tokens())
+            is_ne = "operator!=" in sp or sp == "!=" or any(t.spelling == "!=" for t in node.get_tokens())
+
+            operand_children = []
+            for c in children:
+                sub = c
+                while sub.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                    subs = list(sub.get_children())
+                    if not subs: break
+                    sub = subs[0]
+                if sub.kind == ci.CursorKind.DECL_REF_EXPR and "operator" in sub.spelling:
+                    continue
+                operand_children.append(c)
+
+            saved_str_reg = self.next_str_reg
+
+            if is_concat:
+                _, reg1 = self._compile_expr(operand_children[0])
+                _, reg2 = self._compile_expr(operand_children[1])
+                self.next_str_reg = saved_str_reg
+                dst_reg = self.alloc_str_reg()
+                self.bytecode.append(OP_STR_CONCAT)
+                self.bytecode.append(dst_reg)
+                self.bytecode.append(reg1)
+                self.bytecode.append(reg2)
+                return "string", dst_reg
+
+            elif is_eq or is_ne:
+                _, reg1 = self._compile_expr(operand_children[0])
+                _, reg2 = self._compile_expr(operand_children[1])
+                self.next_str_reg = saved_str_reg
+                dst_int_reg = self.next_int_reg
+                self.next_int_reg += 1
+                op_code = OP_STR_EQ if is_eq else OP_STR_NE
+                self.bytecode.append(op_code)
+                self.bytecode.append(dst_int_reg)
+                self.bytecode.append(reg1)
+                self.bytecode.append(reg2)
+                return "int", dst_int_reg
+
+        raise RuntimeError(f"Unsupported string expression node: {node.kind} {node.spelling}")
+

@@ -89,6 +89,14 @@ def generate_vm_runtime(opcode_shuffle_map=None):
 
     cases_str = "\n".join(cases)
 
+    str_op_18 = mapping.get(0x18, 0x18)
+    str_op_19 = mapping.get(0x19, 0x19)
+    str_op_1a = mapping.get(0x1A, 0x1A)
+    str_op_1b = mapping.get(0x1B, 0x1B)
+    str_op_1c = mapping.get(0x1C, 0x1C)
+    str_op_1d = mapping.get(0x1D, 0x1D)
+    str_op_1e = mapping.get(0x1E, 0x1E)
+
     return f"""\
 // ============================================================
 // Embedded VM runtime (auto-generated, do not edit by hand)
@@ -96,6 +104,7 @@ def generate_vm_runtime(opcode_shuffle_map=None):
 // ============================================================
 #include <cstdint>
 #include <cstddef>
+#include <string>
 
 #if defined(__APPLE__)
 #include <sys/ptrace.h>
@@ -176,6 +185,82 @@ inline int64_t run(const uint8_t* bytecode, size_t len, const int64_t* args, int
         switch (op) {{
 {cases_str}
             default: return 0;
+        }}
+    }}
+}}
+
+struct StringVMContext {{
+    std::string str_regs[16];
+    int64_t int_regs[8] = {{0}};
+    const uint8_t* bytecode = nullptr;
+    size_t bytecode_len = 0;
+    size_t pc = 0;
+    const std::string* str_args = nullptr;
+    int str_arg_count = 0;
+    const std::string* const_pool = nullptr;
+    int const_pool_count = 0;
+}};
+
+inline uint8_t str_fetch8(StringVMContext& c) {{ return c.bytecode[c.pc++]; }}
+
+inline std::string run_str(const uint8_t* bytecode, size_t len,
+                           const std::string* str_args, int argc,
+                           const std::string* const_pool, int pool_count,
+                           int64_t* out_int_result = nullptr,
+                           uint32_t expected_checksum = 0) {{
+    if (debugger_detected_flag()) {{
+        if (out_int_result) *out_int_result = 0;
+        return "";
+    }}
+    if (expected_checksum != 0 && fnv1a_32(bytecode, len) != expected_checksum) {{
+        if (out_int_result) *out_int_result = 0;
+        return "";
+    }}
+    StringVMContext c;
+    c.bytecode = bytecode; c.bytecode_len = len;
+    c.str_args = str_args; c.str_arg_count = argc;
+    c.const_pool = const_pool; c.const_pool_count = pool_count;
+
+    while (true) {{
+        uint8_t op = str_fetch8(c);
+        switch (op) {{
+            case 0x{str_op_18:02x}: {{
+                uint8_t r = str_fetch8(c), a = str_fetch8(c);
+                c.str_regs[r] = c.str_args[a];
+                break;
+            }}
+            case 0x{str_op_19:02x}: {{
+                uint8_t r = str_fetch8(c), idx = str_fetch8(c);
+                c.str_regs[r] = c.const_pool[idx];
+                break;
+            }}
+            case 0x{str_op_1a:02x}: {{
+                uint8_t r = str_fetch8(c), s1 = str_fetch8(c), s2 = str_fetch8(c);
+                c.str_regs[r] = c.str_regs[s1] + c.str_regs[s2];
+                break;
+            }}
+            case 0x{str_op_1b:02x}: {{
+                uint8_t r = str_fetch8(c), s1 = str_fetch8(c), s2 = str_fetch8(c);
+                c.int_regs[r] = (c.str_regs[s1] == c.str_regs[s2]) ? 1 : 0;
+                break;
+            }}
+            case 0x{str_op_1c:02x}: {{
+                uint8_t r = str_fetch8(c), s1 = str_fetch8(c), s2 = str_fetch8(c);
+                c.int_regs[r] = (c.str_regs[s1] != c.str_regs[s2]) ? 1 : 0;
+                break;
+            }}
+            case 0x{str_op_1d:02x}: {{
+                uint8_t r = str_fetch8(c);
+                return c.str_regs[r];
+            }}
+            case 0x{str_op_1e:02x}: {{
+                uint8_t r = str_fetch8(c);
+                if (out_int_result) *out_int_result = c.int_regs[r];
+                return "";
+            }}
+            default:
+                if (out_int_result) *out_int_result = 0;
+                return "";
         }}
     }}
 }}
