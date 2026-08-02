@@ -15,6 +15,7 @@ from bytecode_gen import eligibility_check, FunctionCompiler
 class PipelineContext:
     source_code: str
     filename: str
+    opcode_shuffle_seed: Any = None
     tu: Any = None
     funcs: List[Any] = field(default_factory=list)
     include_lines: List[str] = field(default_factory=list)
@@ -182,6 +183,11 @@ def stage_eligibility_check(ctx: PipelineContext) -> None:
             ok, reason = True, "eligible (string VM)"
         ctx.treatments[f] = (ok, reason)
 
+    struct_names = set()
+    if ctx.tu:
+        struct_names = {c.spelling for c in ctx.tu.cursor.get_children()
+                        if c.kind in (ci.CursorKind.STRUCT_DECL, ci.CursorKind.CLASS_DECL)}
+
     # Pass 2: Prune functions that call a callee that is NOT in the eligible set
     changed = True
     while changed:
@@ -195,6 +201,8 @@ def stage_eligibility_check(ctx: PipelineContext) -> None:
                             children = list(node.get_children())
                             if children:
                                 callee_name = children[0].spelling
+                        if callee_name in struct_names:
+                            continue
                         if callee_name and callee_name not in eligible_set:
                             ctx.treatments[f] = (False, f"calls non-virtualized function '{callee_name}'")
                             eligible_set.remove(f.spelling)
@@ -265,7 +273,7 @@ def stage_virtualize(ctx: PipelineContext) -> None:
 def stage_shuffle_opcodes(ctx: PipelineContext) -> None:
     if not ctx.eligible_funcs and not ctx.eligible_str_funcs:
         return
-    ctx.opcode_shuffle_map = generate_opcode_shuffle()
+    ctx.opcode_shuffle_map = generate_opcode_shuffle(seed=ctx.opcode_shuffle_seed)
     if ctx.eligible_funcs:
         shared_bc = ctx.artifacts["shared_bytecode"]
         shuffled_shared_bc = apply_opcode_shuffle(shared_bc, ctx.opcode_shuffle_map)
@@ -843,8 +851,8 @@ PIPELINE_STAGES = [
 ]
 
 
-def run_pipeline(source_code: str, filename: str) -> Tuple[str, List[str], List[str]]:
-    ctx = PipelineContext(source_code=source_code, filename=filename)
+def run_pipeline(source_code: str, filename: str, opcode_shuffle_seed=None) -> Tuple[str, List[str], List[str]]:
+    ctx = PipelineContext(source_code=source_code, filename=filename, opcode_shuffle_seed=opcode_shuffle_seed)
     for stage in PIPELINE_STAGES:
         stage(ctx)
         if ctx.diag_errors and stage is stage_parse:

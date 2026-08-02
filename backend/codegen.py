@@ -297,5 +297,5 @@ def bytes_to_c_array(name, data):
 from pipeline import run_pipeline
 
 
-def obfuscate(source_code, filename="/tmp/input.cpp"):
-    return run_pipeline(source_code, filename)
+def obfuscate(source_code, filename="/tmp/input.cpp", opcode_shuffle_seed=None):
+    return run_pipeline(source_code, filename, opcode_shuffle_seed=opcode_shuffle_seed)
