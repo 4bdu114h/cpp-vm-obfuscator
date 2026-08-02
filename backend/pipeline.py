@@ -559,6 +559,128 @@ def stage_flatten_control_flow(ctx: PipelineContext) -> None:
 
         new_func_text = header_text + flattened_body
         ctx.artifacts[obf_key] = new_func_text
+        ctx.artifacts[f"{func.spelling}_flattened"] = True
+
+
+def generate_always_true_condition() -> str:
+    """Generates a randomly chosen C++ boolean expression that evaluates to true by construction."""
+    pattern_choice = random.randint(0, 3)
+    if pattern_choice == 0:
+        a = random.randint(-50, 50)
+        b = random.randint(-50, 50)
+        return f"(({a} + {b}) == ({b} + {a}))"
+    elif pattern_choice == 1:
+        a = random.randint(1, 50) * random.choice([-1, 1])
+        b = random.randint(-50, 50)
+        mod_val = abs(a)
+        return f"((({a} * {b}) + {a}) % {mod_val} == 0)"
+    elif pattern_choice == 2:
+        a = random.randint(-50, 50)
+        return f"(({a} * {a}) >= 0)"
+    else:
+        a = random.randint(-50, 50)
+        return f"((({a} * 2) % 2) == 0)"
+
+
+def generate_junk_code() -> str:
+    """Generates a semantically inert, 100% side-effect-free C++ dead code block."""
+    from codegen import random_name
+
+    var_name = random_name("dead_")
+    val1 = random.randint(1, 100)
+    val2 = random.randint(1, 100)
+    op = random.choice(["+", "-", "*"])
+    return f"{{ int {var_name} = {val1} {op} {val2}; (void){var_name}; }}"
+
+
+def stage_inject_dead_code(ctx: PipelineContext) -> None:
+    """Injects fake, never-executed decoy branches (always-true condition guarding real statement,
+    decoy else branch with inert junk code) into fallback functions that are NOT already flattened
+    and contain >= 2 top-level statements."""
+    if not ctx.fallback_funcs:
+        return
+
+    with open(ctx.filename) as f:
+        original_text = f.read()
+
+    for func in ctx.fallback_funcs:
+        # Check if already flattened by stage_flatten_control_flow
+        if ctx.artifacts.get(f"{func.spelling}_flattened"):
+            continue
+
+        obf_key = f"{func.spelling}_obfuscated_text"
+        body = next((c for c in func.get_children() if c.kind == ci.CursorKind.COMPOUND_STMT), None)
+        if body is None:
+            continue
+
+        stmts = list(body.get_children())
+        if len(stmts) < 2:
+            continue
+
+        # Filter candidate statements (must not be DECL_STMT and must not contain RETURN_STMT)
+        candidate_stmts = []
+        for s in stmts:
+            if s.kind == ci.CursorKind.DECL_STMT:
+                continue
+            has_return = False
+            for n in s.walk_preorder():
+                if n.kind == ci.CursorKind.RETURN_STMT:
+                    has_return = True
+                    break
+            if not has_return:
+                candidate_stmts.append(s)
+
+        if not candidate_stmts:
+            continue
+
+        # Pick 1 to 3 statements to wrap
+        count_to_wrap = min(len(candidate_stmts), random.randint(1, 3))
+        stmts_to_wrap = set(random.sample(candidate_stmts, count_to_wrap))
+
+        func_start = func.extent.start.offset
+        body_start = body.extent.start.offset
+        header_text = original_text[func_start:body_start]
+        for old, new in ctx.rename_map.items():
+            header_text = re.sub(rf"\b{re.escape(old)}\b", new, header_text)
+
+        func_replacements = ctx.func_replacements.get(func, [])
+        stmt_texts = []
+
+        for s in stmts:
+            s_rel_start = s.extent.start.offset - func_start
+            s_rel_end = s.extent.end.offset - func_start
+            s_text_raw = original_text[s.extent.start.offset:s.extent.end.offset]
+
+            s_repls = [(r[0] - s_rel_start, r[1] - s_rel_start, r[2]) for r in func_replacements if s_rel_start <= r[0] < r[1] <= s_rel_end]
+            s_repls.sort(key=lambda x: x[0])
+
+            pieces = []
+            last_pos = 0
+            for r_start_rel, r_end_rel, obf_expr in s_repls:
+                pieces.append(s_text_raw[last_pos:r_start_rel])
+                pieces.append(obf_expr)
+                last_pos = r_end_rel
+            pieces.append(s_text_raw[last_pos:])
+            s_text = "".join(pieces).strip()
+
+            # Apply identifier renaming
+            for old, new in ctx.rename_map.items():
+                s_text = re.sub(rf"\b{re.escape(old)}\b", new, s_text)
+
+            if not s_text.endswith(";"):
+                s_text += ";"
+
+            if s in stmts_to_wrap:
+                cond = generate_always_true_condition()
+                junk = generate_junk_code()
+                wrapped = f"if ({cond}) {{\n        {s_text}\n    }} else {junk}"
+                stmt_texts.append(wrapped)
+            else:
+                stmt_texts.append(s_text)
+
+        body_inner = "\n    ".join(stmt_texts)
+        new_func_text = f"{header_text} {{\n    {body_inner}\n}}"
+        ctx.artifacts[obf_key] = new_func_text
 
 
 def stage_assemble_output(ctx: PipelineContext) -> None:
@@ -626,6 +748,7 @@ PIPELINE_STAGES = [
     stage_obfuscate_literals,
     stage_encrypt_strings,
     stage_flatten_control_flow,
+    stage_inject_dead_code,
     stage_assemble_output,
 ]
 
