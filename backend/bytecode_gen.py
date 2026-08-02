@@ -102,13 +102,14 @@ ALLOWED_KINDS = {
     ci.CursorKind.INIT_LIST_EXPR, ci.CursorKind.CALL_EXPR,
     ci.CursorKind.MEMBER_REF_EXPR, ci.CursorKind.TYPE_REF,
     ci.CursorKind.STRUCT_DECL, ci.CursorKind.FIELD_DECL,
+    ci.CursorKind.CXX_METHOD, ci.CursorKind.CXX_THIS_EXPR,
 }
 
 
 def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=None, struct_names=None):
     """Returns (True, reason) if this function can be fully virtualized,
     (False, reason) otherwise. Only allows: int/struct params (total slots <= 4), int/struct locals,
-    fixed-size int arrays, arithmetic, comparisons, loops, if/return, and calls (including recursive / multi-level)."""
+    fixed-size int arrays, arithmetic, comparisons, loops, if/return, calls, and struct methods."""
     if known_leaf_functions is not None and all_func_names is None:
         allowed_callees = known_leaf_functions
     else:
@@ -159,6 +160,41 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
 
     bad = []
 
+    rec_methods = set()
+    tu = func_cursor.translation_unit if hasattr(func_cursor, 'translation_unit') else None
+    if tu:
+        for s_node in tu.cursor.get_children():
+            if s_node.kind in (ci.CursorKind.STRUCT_DECL, ci.CursorKind.CLASS_DECL):
+                s_name = s_node.spelling
+                methods = {c.spelling: c for c in s_node.get_children() if c.kind == ci.CursorKind.CXX_METHOD}
+                if not methods:
+                    continue
+                graph = {m_name: set() for m_name in methods}
+                for m_name, m_cursor in methods.items():
+                    for n in m_cursor.walk_preorder():
+                        if n.kind == ci.CursorKind.CALL_EXPR:
+                            n_children = list(n.get_children())
+                            if n_children and n_children[0].kind == ci.CursorKind.MEMBER_REF_EXPR:
+                                target_m = n_children[0].spelling
+                                if target_m in methods:
+                                    graph[m_name].add(target_m)
+
+                cycles = set()
+                def dfs(n_m, path, visited):
+                    visited.add(n_m)
+                    path.append(n_m)
+                    for neighbor in graph.get(n_m, []):
+                        if neighbor in path:
+                            cycles.update(path[path.index(neighbor):])
+                        elif neighbor not in visited:
+                            dfs(neighbor, path, visited)
+                    path.pop()
+
+                for m_name in methods:
+                    dfs(m_name, [], set())
+                for m_name in cycles:
+                    rec_methods.add((s_name, m_name))
+
     def get_struct_fields(decl_cursor):
         if hasattr(decl_cursor.type, 'get_fields'):
             fields = list(decl_cursor.type.get_fields())
@@ -169,7 +205,22 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
         if node.kind not in ALLOWED_KINDS:
             bad.append(str(node.kind))
             return
-        if node.kind == ci.CursorKind.VAR_DECL:
+        if node.kind == ci.CursorKind.STRUCT_DECL:
+            s_name = node.spelling
+            for child in node.get_children():
+                if child.kind == ci.CursorKind.CXX_METHOD:
+                    m_name = child.spelling
+                    if (s_name, m_name) in rec_methods:
+                        bad.append(f"struct method '{m_name}' is recursive (recursion not supported for inlined methods)")
+                        return
+                    if child.result_type.spelling != "int":
+                        bad.append(f"method '{child.spelling}' with non-int return type '{child.result_type.spelling}'")
+                        return
+                    for mp in child.get_arguments():
+                        if mp.type.spelling != "int":
+                            bad.append(f"method '{child.spelling}' parameter '{mp.spelling}' of non-int type '{mp.type.spelling}'")
+                            return
+        elif node.kind == ci.CursorKind.VAR_DECL:
             if node.type.kind == ci.TypeKind.CONSTANTARRAY:
                 if node.type.element_type.spelling != "int":
                     bad.append(f"non-int array '{node.type.spelling}'")
@@ -188,9 +239,34 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
                 bad.append(f"unsupported variable type '{node.type.spelling}'")
                 return
         elif node.kind == ci.CursorKind.CALL_EXPR:
+            children = list(node.get_children())
+            if children and children[0].kind == ci.CursorKind.MEMBER_REF_EXPR:
+                mem_ref = children[0]
+                m_name = mem_ref.spelling
+                for (s_n, rec_m) in rec_methods:
+                    if m_name == rec_m:
+                        bad.append(f"struct method '{m_name}' is recursive (recursion not supported for inlined methods)")
+                        return
+                mem_children = list(mem_ref.get_children())
+                if mem_children:
+                    inst = mem_children[0]
+                    while inst.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                        sub_inst = list(inst.get_children())
+                        if sub_inst: inst = sub_inst[0]
+                        else: break
+                    if inst.kind != ci.CursorKind.DECL_REF_EXPR:
+                        bad.append(f"method call '{node.spelling}' on non-variable instance")
+                        return
+                    defn = inst.get_definition()
+                    if defn and defn.kind == ci.CursorKind.PARM_DECL:
+                        bad.append(f"method call '{node.spelling}' on struct parameter '{inst.spelling}'")
+                        return
+                    if defn and defn.kind != ci.CursorKind.VAR_DECL:
+                        bad.append(f"method call '{node.spelling}' on non-local struct variable '{inst.spelling}'")
+                        return
+                return
             callee_name = node.spelling
             if not callee_name:
-                children = list(node.get_children())
                 if children:
                     callee_name = children[0].spelling
             if callee_name in struct_names:
@@ -200,7 +276,6 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
                 return
             args = list(node.get_arguments())
             if not args:
-                children = list(node.get_children())
                 if len(children) > 1:
                     args = children[1:]
             total_slots = 0
@@ -311,6 +386,12 @@ class FunctionCompiler:
         self.struct_offsets = {} # struct var name -> (base_offset, {field_name: field_index})
         self.func_entry_offsets = func_entry_offsets or {}  # callee name -> offset
         self.struct_names = struct_names or set()
+        self.struct_methods = {}
+        self.current_this_offset = None
+        self.current_this_fields = None
+        self.in_method_return = False
+        self.method_ret_reg = None
+        self.method_ret_jmps = []
 
     def alloc_reg(self):
         r = self.next_reg
@@ -324,6 +405,15 @@ class FunctionCompiler:
             self.next_reg = max(self.var_reg.values()) + 1
         else:
             self.next_reg = 0
+
+    def copy_reg(self, r_dst, r_src):
+        if r_dst == r_src:
+            return
+        r_zero = self.alloc_reg()
+        if r_zero == r_src:
+            r_zero = self.alloc_reg()
+        self.b.load_const(r_zero, 0)
+        self.b.binop(OP_ADD, r_dst, r_src, r_zero)
 
     def parse_array_subscript(self, node):
         children = list(node.get_children())
@@ -340,14 +430,27 @@ class FunctionCompiler:
     def parse_member_ref(self, node):
         field_name = node.spelling
         children = list(node.get_children())
-        if not children:
-            raise RuntimeError(f"invalid member ref expr: {node.spelling}")
+        if not children or (children[0].kind in (ci.CursorKind.CXX_THIS_EXPR, ci.CursorKind.UNEXPOSED_EXPR) and not list(children[0].get_children())):
+            if self.current_this_offset is None or self.current_this_fields is None:
+                raise RuntimeError(f"implicit member reference '{field_name}' outside of method scope")
+            if field_name not in self.current_this_fields:
+                raise RuntimeError(f"unknown field '{field_name}' in struct method scope")
+            return self.current_this_offset + self.current_this_fields[field_name]
+
         child = children[0]
         while child.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
             child_subs = list(child.get_children())
             if not child_subs:
                 break
             child = child_subs[0]
+
+        if child.kind == ci.CursorKind.CXX_THIS_EXPR:
+            if self.current_this_offset is None or self.current_this_fields is None:
+                raise RuntimeError(f"explicit 'this->{field_name}' reference outside of method scope")
+            if field_name not in self.current_this_fields:
+                raise RuntimeError(f"unknown field '{field_name}' in struct method scope")
+            return self.current_this_offset + self.current_this_fields[field_name]
+
         if child.kind == ci.CursorKind.DECL_REF_EXPR:
             struct_name = child.spelling
             if struct_name not in self.struct_offsets:
@@ -383,9 +486,15 @@ class FunctionCompiler:
         return [c for c in decl_cursor.get_children() if c.kind == ci.CursorKind.FIELD_DECL]
 
     def compile_function(self, func_cursor):
-        if not self.struct_names and hasattr(func_cursor, 'translation_unit') and func_cursor.translation_unit:
-            self.struct_names = {c.spelling for c in func_cursor.translation_unit.cursor.get_children()
-                                 if c.kind in (ci.CursorKind.STRUCT_DECL, ci.CursorKind.CLASS_DECL)}
+        if hasattr(func_cursor, 'translation_unit') and func_cursor.translation_unit:
+            if not self.struct_names:
+                self.struct_names = {c.spelling for c in func_cursor.translation_unit.cursor.get_children()
+                                     if c.kind in (ci.CursorKind.STRUCT_DECL, ci.CursorKind.CLASS_DECL)}
+            for c in func_cursor.translation_unit.cursor.get_children():
+                if c.kind in (ci.CursorKind.STRUCT_DECL, ci.CursorKind.CLASS_DECL):
+                    m_map = {m.spelling: m for m in c.get_children() if m.kind == ci.CursorKind.CXX_METHOD}
+                    if m_map:
+                        self.struct_methods[c.spelling] = m_map
 
         self.result_type = func_cursor.result_type
         params = list(func_cursor.get_arguments())
@@ -691,6 +800,18 @@ class FunctionCompiler:
 
         elif node.kind == ci.CursorKind.RETURN_STMT:
             children = list(node.get_children())
+            if self.in_method_return:
+                if not children:
+                    r_zero = self.alloc_reg()
+                    self.b.load_const(r_zero, 0)
+                    self.copy_reg(self.method_ret_reg, r_zero)
+                else:
+                    r_val = self.compile_expr(children[0])
+                    self.copy_reg(self.method_ret_reg, r_val)
+                patch_loc = self.b.jmp()
+                self.method_ret_jmps.append(patch_loc)
+                return
+
             if not children:
                 self.b.ret_const(0)
                 return
@@ -731,12 +852,6 @@ class FunctionCompiler:
                     self.b.ret_reg(r)
         else:
             raise RuntimeError(f"unhandled statement kind: {node.kind}")
-
-    def copy_reg(self, r_dst, r_src):
-        # MOV emulated as ADD with 0 to keep opcode set minimal in this MVP
-        zero = self.alloc_reg()
-        self.b.load_const(zero, 0)
-        self.b.binop(OP_ADD, r_dst, r_src, zero)
 
     def compile_expr(self, node):
         if node.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
@@ -784,9 +899,79 @@ class FunctionCompiler:
             return r
 
         if node.kind == ci.CursorKind.CALL_EXPR:
+            children = list(node.get_children())
+            if children and children[0].kind == ci.CursorKind.MEMBER_REF_EXPR:
+                mem_ref = children[0]
+                mem_children = list(mem_ref.get_children())
+                inst = None
+                base_offset = None
+                field_map = None
+                if mem_children:
+                    inst = mem_children[0]
+                    while inst.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                        subs = list(inst.get_children())
+                        if subs: inst = subs[0]
+                        else: break
+
+                if inst and inst.kind == ci.CursorKind.CXX_THIS_EXPR:
+                    base_offset = self.current_this_offset
+                    field_map = self.current_this_fields
+                elif not mem_children or not inst:
+                    base_offset = self.current_this_offset
+                    field_map = self.current_this_fields
+                elif inst and inst.kind == ci.CursorKind.DECL_REF_EXPR and inst.spelling in self.struct_offsets:
+                    base_offset, field_map = self.struct_offsets[inst.spelling]
+
+                if base_offset is not None and field_map is not None:
+                    method_cursor = mem_ref.get_definition()
+                    if not method_cursor or method_cursor.kind != ci.CursorKind.CXX_METHOD:
+                        decl_name = None
+                        if inst and hasattr(inst.type, 'get_declaration'):
+                            decl_name = inst.type.get_declaration().spelling
+                        if not decl_name and hasattr(mem_ref.type, 'get_declaration'):
+                            decl_name = mem_ref.type.get_declaration().spelling
+                        if decl_name and decl_name in self.struct_methods and mem_ref.spelling in self.struct_methods[decl_name]:
+                            method_cursor = self.struct_methods[decl_name][mem_ref.spelling]
+                        else:
+                            for s_n, m_m in self.struct_methods.items():
+                                if mem_ref.spelling in m_m:
+                                    method_cursor = m_m[mem_ref.spelling]
+                                    break
+                    if method_cursor and method_cursor.kind == ci.CursorKind.CXX_METHOD:
+                        raw_args = list(node.get_arguments())
+                        if not raw_args and len(children) > 1:
+                            raw_args = children[1:]
+
+                        m_params = list(method_cursor.get_arguments())
+                        for p_node, arg_expr in zip(m_params, raw_args):
+                            r_arg = self.compile_expr(arg_expr)
+                            self.var_reg[p_node.spelling] = r_arg
+
+                        r_dst = self.alloc_reg()
+
+                        old_this_off, old_this_f = self.current_this_offset, self.current_this_fields
+                        old_in_ret, old_ret_r, old_jmps = self.in_method_return, self.method_ret_reg, self.method_ret_jmps
+
+                        self.current_this_offset = base_offset
+                        self.current_this_fields = field_map
+                        self.in_method_return = True
+                        self.method_ret_reg = r_dst
+                        self.method_ret_jmps = []
+
+                        method_body = [c for c in method_cursor.get_children() if c.kind == ci.CursorKind.COMPOUND_STMT][0]
+                        self.compile_stmt(method_body)
+
+                        end_target = self.b.here()
+                        for patch_loc in self.method_ret_jmps:
+                            self.b.patch(patch_loc, end_target)
+
+                        self.current_this_offset, self.current_this_fields = old_this_off, old_this_f
+                        self.in_method_return, self.method_ret_reg, self.method_ret_jmps = old_in_ret, old_ret_r, old_jmps
+
+                        return r_dst
+
             callee_name = node.spelling
             if not callee_name:
-                children = list(node.get_children())
                 if children:
                     callee_name = children[0].spelling
             if callee_name not in self.func_entry_offsets:

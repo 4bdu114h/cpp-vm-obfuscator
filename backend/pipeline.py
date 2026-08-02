@@ -196,9 +196,11 @@ def stage_eligibility_check(ctx: PipelineContext) -> None:
             if ctx.treatments[f][0] and "string VM" not in ctx.treatments[f][1]:
                 for node in f.walk_preorder():
                     if node.kind == ci.CursorKind.CALL_EXPR:
+                        children = list(node.get_children())
+                        if children and children[0].kind == ci.CursorKind.MEMBER_REF_EXPR:
+                            continue  # Struct method call inlined into caller
                         callee_name = node.spelling
                         if not callee_name:
-                            children = list(node.get_children())
                             if children:
                                 callee_name = children[0].spelling
                         if callee_name in struct_names:
