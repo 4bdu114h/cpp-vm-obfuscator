@@ -74,14 +74,15 @@ def generate_vm_runtime(opcode_shuffle_map=None):
         (0x0F, "{ c.pc = fetch16(c); break; }"),
         (0x10, "{ uint8_t r=fetch8(c); uint16_t t=fetch16(c); if (c.regs[r]!=0) c.pc=t; break; }"),
         (0x11, "{ uint8_t r=fetch8(c); uint16_t t=fetch16(c); if (c.regs[r]==0) c.pc=t; break; }"),
-        (0x12, "{ int64_t v = fetch64(c); if (c.call_depth > 0) { c.call_depth--; CallFrame& frame = c.call_stack[c.call_depth]; __builtin_memcpy(c.regs, frame.regs, sizeof(c.regs)); __builtin_memcpy(c.mem, frame.mem, sizeof(c.mem)); c.regs[frame.dst_reg] = v; c.args = (c.call_depth > 0) ? c.call_stack[c.call_depth - 1].saved_args_buf : c.original_args; c.pc = frame.return_pc; break; } return v; }"),
-        (0x13, "{ uint8_t r = fetch8(c); int64_t v = c.regs[r]; if (c.call_depth > 0) { c.call_depth--; CallFrame& frame = c.call_stack[c.call_depth]; __builtin_memcpy(c.regs, frame.regs, sizeof(c.regs)); __builtin_memcpy(c.mem, frame.mem, sizeof(c.mem)); c.regs[frame.dst_reg] = v; c.args = (c.call_depth > 0) ? c.call_stack[c.call_depth - 1].saved_args_buf : c.original_args; c.pc = frame.return_pc; break; } return v; }"),
+        (0x12, "{ int64_t v = fetch64(c); if (c.call_depth > 0) { c.call_depth--; CallFrame& frame = c.call_stack[c.call_depth]; __builtin_memcpy(c.regs, frame.regs, sizeof(c.regs)); c.frame_base = frame.saved_frame_base; c.regs[frame.dst_reg] = v; c.args = (c.call_depth > 0) ? c.call_stack[c.call_depth - 1].saved_args_buf : c.original_args; c.pc = frame.return_pc; break; } return v; }"),
+        (0x13, "{ uint8_t r = fetch8(c); int64_t v = c.regs[r]; if (c.call_depth > 0) { c.call_depth--; CallFrame& frame = c.call_stack[c.call_depth]; __builtin_memcpy(c.regs, frame.regs, sizeof(c.regs)); c.frame_base = frame.saved_frame_base; c.regs[frame.dst_reg] = v; c.args = (c.call_depth > 0) ? c.call_stack[c.call_depth - 1].saved_args_buf : c.original_args; c.pc = frame.return_pc; break; } return v; }"),
         (0x14, "{ break; }"),
-        (0x15, "{ uint8_t r = fetch8(c), base = fetch8(c), idx_r = fetch8(c); c.regs[r] = c.mem[base + c.regs[idx_r]]; break; }"),
-        (0x16, "{ uint8_t base = fetch8(c), idx_r = fetch8(c), src_r = fetch8(c); c.mem[base + c.regs[idx_r]] = c.regs[src_r]; break; }"),
-        (0x17, "{ uint16_t target = fetch16(c); uint8_t a0 = fetch8(c), a1 = fetch8(c), a2 = fetch8(c), a3 = fetch8(c); uint8_t r_dst = fetch8(c); if (c.call_depth >= MAX_CALL_DEPTH) return 0; CallFrame& frame = c.call_stack[c.call_depth]; __builtin_memcpy(frame.regs, c.regs, sizeof(c.regs)); __builtin_memcpy(frame.mem, c.mem, sizeof(c.mem)); frame.return_pc = c.pc; frame.dst_reg = r_dst; frame.saved_args_buf[0] = (a0 != 0xFF) ? c.regs[a0] : 0; frame.saved_args_buf[1] = (a1 != 0xFF) ? c.regs[a1] : 0; frame.saved_args_buf[2] = (a2 != 0xFF) ? c.regs[a2] : 0; frame.saved_args_buf[3] = (a3 != 0xFF) ? c.regs[a3] : 0; c.call_depth++; __builtin_memset(c.regs, 0, sizeof(c.regs)); __builtin_memset(c.mem, 0, sizeof(c.mem)); c.args = frame.saved_args_buf; c.pc = target; break; }"),
-        (0x1F, "{ uint8_t n = fetch8(c), r0 = fetch8(c), r1 = fetch8(c), r2 = fetch8(c), r3 = fetch8(c); c.struct_ret_buf[0] = (r0 != 0xFF) ? c.regs[r0] : 0; c.struct_ret_buf[1] = (r1 != 0xFF) ? c.regs[r1] : 0; c.struct_ret_buf[2] = (r2 != 0xFF) ? c.regs[r2] : 0; c.struct_ret_buf[3] = (r3 != 0xFF) ? c.regs[r3] : 0; if (c.out_struct_buf) { __builtin_memcpy(c.out_struct_buf, c.struct_ret_buf, sizeof(c.struct_ret_buf)); } if (c.call_depth > 0) { c.call_depth--; CallFrame& frame = c.call_stack[c.call_depth]; __builtin_memcpy(c.regs, frame.regs, sizeof(c.regs)); __builtin_memcpy(c.mem, frame.mem, sizeof(c.mem)); c.args = (c.call_depth > 0) ? c.call_stack[c.call_depth - 1].saved_args_buf : c.original_args; c.pc = frame.return_pc; break; } return 0; }"),
+        (0x15, "{ uint8_t r = fetch8(c), base = fetch8(c), idx_r = fetch8(c); c.regs[r] = (base == 0xFF) ? c.mem[c.regs[idx_r]] : c.mem[c.frame_base + base + c.regs[idx_r]]; break; }"),
+        (0x16, "{ uint8_t base = fetch8(c), idx_r = fetch8(c), src_r = fetch8(c); if (base == 0xFF) { c.mem[c.regs[idx_r]] = c.regs[src_r]; } else { c.mem[c.frame_base + base + c.regs[idx_r]] = c.regs[src_r]; } break; }"),
+        (0x17, "{ uint16_t target = fetch16(c); uint8_t a0 = fetch8(c), a1 = fetch8(c), a2 = fetch8(c), a3 = fetch8(c); uint8_t r_dst = fetch8(c); if (c.call_depth >= MAX_CALL_DEPTH) return 0; CallFrame& frame = c.call_stack[c.call_depth]; __builtin_memcpy(frame.regs, c.regs, sizeof(c.regs)); frame.saved_frame_base = c.frame_base; frame.return_pc = c.pc; frame.dst_reg = r_dst; frame.saved_args_buf[0] = (a0 != 0xFF) ? c.regs[a0] : 0; frame.saved_args_buf[1] = (a1 != 0xFF) ? c.regs[a1] : 0; frame.saved_args_buf[2] = (a2 != 0xFF) ? c.regs[a2] : 0; frame.saved_args_buf[3] = (a3 != 0xFF) ? c.regs[a3] : 0; c.call_depth++; c.frame_base += 16; __builtin_memset(c.regs, 0, sizeof(c.regs)); c.args = frame.saved_args_buf; c.pc = target; break; }"),
+        (0x1F, "{ uint8_t n = fetch8(c), r0 = fetch8(c), r1 = fetch8(c), r2 = fetch8(c), r3 = fetch8(c); c.struct_ret_buf[0] = (r0 != 0xFF) ? c.regs[r0] : 0; c.struct_ret_buf[1] = (r1 != 0xFF) ? c.regs[r1] : 0; c.struct_ret_buf[2] = (r2 != 0xFF) ? c.regs[r2] : 0; c.struct_ret_buf[3] = (r3 != 0xFF) ? c.regs[r3] : 0; if (c.out_struct_buf) { __builtin_memcpy(c.out_struct_buf, c.struct_ret_buf, sizeof(c.struct_ret_buf)); } if (c.call_depth > 0) { c.call_depth--; CallFrame& frame = c.call_stack[c.call_depth]; __builtin_memcpy(c.regs, frame.regs, sizeof(c.regs)); c.frame_base = frame.saved_frame_base; c.args = (c.call_depth > 0) ? c.call_stack[c.call_depth - 1].saved_args_buf : c.original_args; c.pc = frame.return_pc; break; } return 0; }"),
         (0x20, "{ uint8_t r = fetch8(c), idx = fetch8(c); c.regs[r] = c.struct_ret_buf[idx]; break; }"),
+        (0x21, "{ uint8_t r = fetch8(c), slot = fetch8(c); c.regs[r] = c.frame_base + slot; break; }"),
     ]
 
     cases = []
@@ -138,7 +139,7 @@ inline bool& debugger_detected_flag() {{
 static const int MAX_CALL_DEPTH = 32;
 struct CallFrame {{
     int64_t regs[16];
-    int64_t mem[256];
+    int saved_frame_base;
     size_t return_pc;
     uint8_t dst_reg;
     int64_t saved_args_buf[4];
@@ -147,6 +148,7 @@ struct CallFrame {{
 struct VMContext {{
     int64_t regs[16] = {{0}};
     int64_t mem[256] = {{0}};
+    int frame_base = 0;
     int64_t struct_ret_buf[4] = {{0}};
     int64_t* out_struct_buf = nullptr;
     CallFrame call_stack[MAX_CALL_DEPTH];

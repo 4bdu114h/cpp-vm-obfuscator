@@ -839,6 +839,11 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
                 param_list_parts.append(f"{p.type.spelling} {p.spelling}")
                 if p.type.spelling == "int":
                     args_init_parts.append(f"(int64_t){p.spelling}")
+                elif p.type.kind in (ci.TypeKind.LVALUEREFERENCE, ci.TypeKind.POINTER):
+                    if p.type.kind == ci.TypeKind.LVALUEREFERENCE:
+                        args_init_parts.append(f"(int64_t)&{p.spelling}")
+                    else:
+                        args_init_parts.append(f"(int64_t){p.spelling}")
                 elif p.type.kind == ci.TypeKind.RECORD:
                     decl = p.type.get_declaration()
                     fields = get_struct_fields_pipeline(decl)
@@ -854,6 +859,13 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
                     f"int {f.spelling}({param_list}) {{\n"
                     f"    int64_t __args[] = {{ {args_init} }};\n"
                     f"    return (int)vm_rt::run({arr_name}, {arr_name}_len, __args, {total_slots}, {offset}, {checksum_str});\n"
+                    f"}}\n\n"
+                )
+            elif ret_type.spelling == "void" or ret_type.kind == ci.TypeKind.VOID:
+                output_parts.append(
+                    f"void {f.spelling}({param_list}) {{\n"
+                    f"    int64_t __args[] = {{ {args_init} }};\n"
+                    f"    vm_rt::run({arr_name}, {arr_name}_len, __args, {total_slots}, {offset}, {checksum_str});\n"
                     f"}}\n\n"
                 )
             elif ret_type.kind == ci.TypeKind.RECORD:

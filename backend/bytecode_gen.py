@@ -51,6 +51,7 @@ BIN_OP_TO_OPCODE = {
 
 OP_RET_STRUCT = 0x1F
 OP_STRUCT_RET_LOAD = 0x20
+OP_LOAD_FRAME_ADDR = 0x21
 
 OPCODE_OPERAND_WIDTHS = {
     OP_LOAD_ARG: 2,
@@ -85,6 +86,7 @@ OPCODE_OPERAND_WIDTHS = {
     OP_RET_STR_INT: 1,
     OP_RET_STRUCT: 5,
     OP_STRUCT_RET_LOAD: 2,
+    OP_LOAD_FRAME_ADDR: 2,
 }
 
 ALL_OPCODES = list(OPCODE_OPERAND_WIDTHS.keys())
@@ -127,9 +129,11 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
             if fields: return fields
         return [c for c in decl_cursor.get_children() if c.kind == ci.CursorKind.FIELD_DECL]
 
-    # Return type check: int or int-only fields struct (max 4 fields)
+    # Return type check: int, void, or int-only fields struct (max 4 fields)
     ret_type = func_cursor.result_type
-    if ret_type.spelling != "int":
+    if ret_type.kind in (ci.TypeKind.LVALUEREFERENCE, ci.TypeKind.POINTER):
+        return False, f"unsupported return type '{ret_type.spelling}' (pointers/references not supported as return types)"
+    if ret_type.spelling != "int" and ret_type.spelling != "void" and ret_type.kind != ci.TypeKind.VOID:
         if ret_type.kind == ci.TypeKind.RECORD:
             decl = ret_type.get_declaration()
             fields = get_struct_fields(decl)
@@ -147,6 +151,10 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
     for p in func_cursor.get_arguments():
         if p.type.spelling == "int":
             pass
+        elif p.type.kind in (ci.TypeKind.LVALUEREFERENCE, ci.TypeKind.POINTER):
+            pointee = p.type.get_pointee()
+            if pointee.spelling != "int" and pointee.kind != ci.TypeKind.INT:
+                return False, f"unsupported pointer/reference parameter '{p.spelling}' to non-int type '{pointee.spelling}'"
         elif p.type.kind == ci.TypeKind.RECORD:
             decl = p.type.get_declaration()
             fields = get_struct_fields(decl)
@@ -157,6 +165,81 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
                     return False, f"unsupported struct parameter field '{f.spelling}' of type '{f.type.spelling}' (non-int)"
         else:
             return False, f"unsupported parameter type '{p.type.spelling}'"
+
+    # Per-frame memory budget check: combined local memory slots (struct params, arrays, structs, address-taken variables) <= 16
+    total_mem_slots = 0
+    for p in func_cursor.get_arguments():
+        if p.type.kind == ci.TypeKind.RECORD:
+            decl = p.type.get_declaration()
+            fields = get_struct_fields(decl)
+            total_mem_slots += len(fields)
+
+    body_cursor = None
+    for c in func_cursor.get_children():
+        if c.kind == ci.CursorKind.COMPOUND_STMT:
+            body_cursor = c
+
+    if body_cursor:
+        address_taken_names = set()
+        for n in body_cursor.walk_preorder():
+            if n.kind == ci.CursorKind.VAR_DECL:
+                if n.type.kind == ci.TypeKind.CONSTANTARRAY:
+                    total_mem_slots += n.type.element_count
+                elif n.type.kind == ci.TypeKind.RECORD:
+                    decl = n.type.get_declaration()
+                    fields = get_struct_fields(decl)
+                    total_mem_slots += len(fields)
+            elif n.kind == ci.CursorKind.UNARY_OPERATOR:
+                toks = [t.spelling for t in n.get_tokens()]
+                if toks and toks[0] == "&":
+                    subs = list(n.get_children())
+                    if subs:
+                        target = subs[0]
+                        while target.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                            c_subs = list(target.get_children())
+                            if c_subs: target = c_subs[0]
+                            else: break
+                        if target.kind == ci.CursorKind.DECL_REF_EXPR:
+                            address_taken_names.add(target.spelling)
+            elif n.kind == ci.CursorKind.CALL_EXPR:
+                callee_cursor = n.get_definition() if hasattr(n, 'get_definition') else None
+                if callee_cursor and callee_cursor.kind == ci.CursorKind.FUNCTION_DECL:
+                    c_params = list(callee_cursor.get_arguments())
+                    args = list(n.get_arguments())
+                    for p_node, arg_expr in zip(c_params, args):
+                        if p_node.type.kind in (ci.TypeKind.LVALUEREFERENCE, ci.TypeKind.POINTER):
+                            sub = arg_expr
+                            while sub.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                                c_subs = list(sub.get_children())
+                                if c_subs: sub = c_subs[0]
+                                else: break
+                            if sub.kind == ci.CursorKind.DECL_REF_EXPR:
+                                address_taken_names.add(sub.spelling)
+                            elif sub.kind == ci.CursorKind.UNARY_OPERATOR:
+                                s_toks = [t.spelling for t in sub.get_tokens()]
+                                if s_toks and s_toks[0] == "&":
+                                    c_subs = list(sub.get_children())
+                                    if c_subs:
+                                        c_target = c_subs[0]
+                                        while c_target.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                                            subs2 = list(c_target.get_children())
+                                            if subs2: c_target = subs2[0]
+                                            else: break
+                                        if c_target.kind == ci.CursorKind.DECL_REF_EXPR:
+                                            address_taken_names.add(c_target.spelling)
+
+        for var_name in address_taken_names:
+            is_scalar = True
+            for n in body_cursor.walk_preorder():
+                if n.kind == ci.CursorKind.VAR_DECL and n.spelling == var_name:
+                    if n.type.kind in (ci.TypeKind.CONSTANTARRAY, ci.TypeKind.RECORD):
+                        is_scalar = False
+                    break
+            if is_scalar:
+                total_mem_slots += 1
+
+    if total_mem_slots > 16:
+        return False, f"function local memory allocation ({total_mem_slots} slots) exceeds max per-frame limit of 16 slots"
 
     bad = []
 
@@ -238,6 +321,34 @@ def eligibility_check(func_cursor, all_func_names=None, known_leaf_functions=Non
             elif node.type.kind != ci.TypeKind.INT:
                 bad.append(f"unsupported variable type '{node.type.spelling}'")
                 return
+        elif node.kind == ci.CursorKind.ARRAY_SUBSCRIPT_EXPR:
+            children = list(node.get_children())
+            if children:
+                base = children[0]
+                while base.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                    subs = list(base.get_children())
+                    if subs: base = subs[0]
+                    else: break
+                def_cursor = base.get_definition() if hasattr(base, 'get_definition') and base.get_definition() else None
+                if def_cursor and def_cursor.type.kind in (ci.TypeKind.POINTER, ci.TypeKind.LVALUEREFERENCE):
+                    bad.append("pointer arithmetic/subscript 'p[i]' not supported")
+                    return
+                elif base.kind == ci.CursorKind.DECL_REF_EXPR and base.type.kind in (ci.TypeKind.POINTER, ci.TypeKind.LVALUEREFERENCE) and (not def_cursor or def_cursor.type.kind not in (ci.TypeKind.CONSTANTARRAY, ci.TypeKind.INCOMPLETEARRAY)):
+                    bad.append("pointer arithmetic/subscript 'p[i]' not supported")
+                    return
+        elif node.kind == ci.CursorKind.BINARY_OPERATOR:
+            children = list(node.get_children())
+            if any(c.type.kind in (ci.TypeKind.POINTER, ci.TypeKind.LVALUEREFERENCE) for c in children):
+                bad.append("pointer arithmetic not supported")
+                return
+        elif node.kind == ci.CursorKind.UNARY_OPERATOR:
+            toks = list(node.get_tokens())
+            op_str = toks[0].spelling if toks else ""
+            if op_str in ("++", "--"):
+                children = list(node.get_children())
+                if children and children[0].type.kind in (ci.TypeKind.POINTER, ci.TypeKind.LVALUEREFERENCE):
+                    bad.append("pointer arithmetic 'p++'/'p--' not supported")
+                    return
         elif node.kind == ci.CursorKind.CALL_EXPR:
             children = list(node.get_children())
             if children and children[0].kind == ci.CursorKind.MEMBER_REF_EXPR:
@@ -304,29 +415,36 @@ class BytecodeBuilder:
     def __init__(self, start_offset=0):
         self.start_offset = start_offset
         self.code = bytearray()
+        self.last_op = None
 
     def here(self):
         return self.start_offset + len(self.code)
 
     def load_arg(self, r_dst, arg_index):
+        self.last_op = OP_LOAD_ARG
         self.code += bytes([OP_LOAD_ARG, r_dst, arg_index])
 
     def load_const(self, r_dst, value):
+        self.last_op = OP_LOAD_CONST
         self.code += bytes([OP_LOAD_CONST, r_dst])
         self.code += int(value).to_bytes(8, "little", signed=True)
 
     def binop(self, opcode, r_dst, r_a, r_b):
+        self.last_op = opcode
         self.code += bytes([opcode, r_dst, r_a, r_b])
 
     def jmp_if_true(self, r_cond):
+        self.last_op = OP_JMP_IF_TRUE
         self.code += bytes([OP_JMP_IF_TRUE, r_cond, 0xFF, 0xFF])
         return self.start_offset + len(self.code) - 2
 
     def jmp_if_false(self, r_cond):
+        self.last_op = OP_JMP_IF_FALSE
         self.code += bytes([OP_JMP_IF_FALSE, r_cond, 0xFF, 0xFF])
         return self.start_offset + len(self.code) - 2
 
     def jmp(self):
+        self.last_op = OP_JMP
         self.code += bytes([OP_JMP, 0xFF, 0xFF])
         return self.start_offset + len(self.code) - 2
 
@@ -334,6 +452,7 @@ class BytecodeBuilder:
         """Unconditional jump to an ALREADY KNOWN address (e.g. jumping
         backward to a loop's start) - unlike self.jmp(), which returns a
         patch location for a FORWARD target not yet known."""
+        self.last_op = OP_JMP
         self.code += bytes([OP_JMP])
         self.code += int(target).to_bytes(2, "little")
 
@@ -343,19 +462,24 @@ class BytecodeBuilder:
         self.code[rel_patch_at + 1] = (target >> 8) & 0xFF
 
     def ret_const(self, value):
+        self.last_op = OP_RET_CONST
         self.code += bytes([OP_RET_CONST])
         self.code += int(value).to_bytes(8, "little", signed=True)
 
     def ret_reg(self, r_src):
+        self.last_op = OP_RET_REG
         self.code += bytes([OP_RET_REG, r_src])
 
     def arr_load(self, r_dst, base_offset, r_idx):
+        self.last_op = OP_ARR_LOAD
         self.code += bytes([OP_ARR_LOAD, r_dst, base_offset, r_idx])
 
     def arr_store(self, base_offset, r_idx, r_src):
+        self.last_op = OP_ARR_STORE
         self.code += bytes([OP_ARR_STORE, base_offset, r_idx, r_src])
 
     def call(self, callee_offset, arg_regs, r_dst):
+        self.last_op = OP_CALL
         args_padded = list(arg_regs) + [0xFF] * (4 - len(arg_regs))
         self.code += bytes([OP_CALL])
         self.code += int(callee_offset).to_bytes(2, "little")
@@ -363,6 +487,7 @@ class BytecodeBuilder:
         self.code += bytes([r_dst])
 
     def ret_struct(self, n_fields, field_regs):
+        self.last_op = OP_RET_STRUCT
         r0 = field_regs[0] if len(field_regs) > 0 else 0xFF
         r1 = field_regs[1] if len(field_regs) > 1 else 0xFF
         r2 = field_regs[2] if len(field_regs) > 2 else 0xFF
@@ -370,7 +495,12 @@ class BytecodeBuilder:
         self.code += bytes([OP_RET_STRUCT, n_fields, r0, r1, r2, r3])
 
     def struct_ret_load(self, r_dst, field_idx):
+        self.last_op = OP_STRUCT_RET_LOAD
         self.code += bytes([OP_STRUCT_RET_LOAD, r_dst, field_idx])
+
+    def load_frame_addr(self, r_dst, slot_offset):
+        self.last_op = OP_LOAD_FRAME_ADDR
+        self.code += bytes([OP_LOAD_FRAME_ADDR, r_dst, slot_offset])
 
 
 class FunctionCompiler:
@@ -392,6 +522,9 @@ class FunctionCompiler:
         self.in_method_return = False
         self.method_ret_reg = None
         self.method_ret_jmps = []
+        self.ref_params = set()
+        self.ptr_params = set()
+        self.mem_vars = {}
 
     def alloc_reg(self):
         r = self.next_reg
@@ -506,9 +639,21 @@ class FunctionCompiler:
                 self.b.load_arg(r, slot_idx)
                 self.var_reg[p.spelling] = r
                 slot_idx += 1
+            elif p.type.kind in (ci.TypeKind.LVALUEREFERENCE, ci.TypeKind.POINTER):
+                if p.type.kind == ci.TypeKind.LVALUEREFERENCE:
+                    self.ref_params.add(p.spelling)
+                else:
+                    self.ptr_params.add(p.spelling)
+                self.arg_index[p.spelling] = slot_idx
+                r = self.alloc_reg()
+                self.b.load_arg(r, slot_idx)
+                self.var_reg[p.spelling] = r
+                slot_idx += 1
             elif p.type.kind == ci.TypeKind.RECORD:
                 decl = p.type.get_declaration()
                 fields = self._get_struct_fields(decl)
+                if self.next_mem_offset + len(fields) > 16:
+                    raise RuntimeError(f"struct parameter memory overflow: allocated {self.next_mem_offset + len(fields)} > 16 slots per frame")
                 base_offset = self.next_mem_offset
                 field_map = {f.spelling: idx for idx, f in enumerate(fields)}
                 self.struct_offsets[p.spelling] = (base_offset, field_map)
@@ -527,7 +672,60 @@ class FunctionCompiler:
         for c in func_cursor.get_children():
             if c.kind == ci.CursorKind.COMPOUND_STMT:
                 body = c
+
+        if body:
+            address_taken = set()
+            for n in body.walk_preorder():
+                if n.kind == ci.CursorKind.UNARY_OPERATOR:
+                    toks = [t.spelling for t in n.get_tokens()]
+                    if toks and toks[0] == "&":
+                        subs = list(n.get_children())
+                        if subs:
+                            target = subs[0]
+                            while target.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                                c_subs = list(target.get_children())
+                                if c_subs: target = c_subs[0]
+                                else: break
+                            if target.kind == ci.CursorKind.DECL_REF_EXPR:
+                                address_taken.add(target.spelling)
+                elif n.kind == ci.CursorKind.CALL_EXPR:
+                    callee_cursor = n.get_definition()
+                    if callee_cursor and callee_cursor.kind == ci.CursorKind.FUNCTION_DECL:
+                        c_params = list(callee_cursor.get_arguments())
+                        args = list(n.get_arguments())
+                        for p_node, arg_expr in zip(c_params, args):
+                            if p_node.type.kind in (ci.TypeKind.LVALUEREFERENCE, ci.TypeKind.POINTER):
+                                sub = arg_expr
+                                while sub.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                                    c_subs = list(sub.get_children())
+                                    if c_subs: sub = c_subs[0]
+                                    else: break
+                                if sub.kind == ci.CursorKind.DECL_REF_EXPR:
+                                    address_taken.add(sub.spelling)
+                                elif sub.kind == ci.CursorKind.UNARY_OPERATOR:
+                                    s_toks = [t.spelling for t in sub.get_tokens()]
+                                    if s_toks and s_toks[0] == "&":
+                                        c_subs = list(sub.get_children())
+                                        if c_subs:
+                                            c_target = c_subs[0]
+                                            while c_target.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                                                subs2 = list(c_target.get_children())
+                                                if subs2: c_target = subs2[0]
+                                                else: break
+                                            if c_target.kind == ci.CursorKind.DECL_REF_EXPR:
+                                                address_taken.add(c_target.spelling)
+
+            for var_name in address_taken:
+                if var_name not in self.var_reg and var_name not in self.ref_params and var_name not in self.ptr_params:
+                    if self.next_mem_offset + 1 > 16:
+                        raise RuntimeError(f"address-taken variable memory overflow: allocated {self.next_mem_offset + 1} > 16 slots per frame")
+                    slot = self.next_mem_offset
+                    self.mem_vars[var_name] = slot
+                    self.next_mem_offset += 1
+
         self.compile_stmt(body)
+        if getattr(self.b, 'last_op', None) not in (OP_RET_CONST, OP_RET_REG, OP_RET_STRUCT):
+            self.b.ret_const(0)
         return bytes(self.b.code)
 
     def compile_stmt(self, node):
@@ -547,8 +745,8 @@ class FunctionCompiler:
                 if elem_type != "int":
                     raise RuntimeError(f"unsupported array element type '{elem_type}'")
                 size = node.type.element_count
-                if self.next_mem_offset + size > 256:
-                    raise RuntimeError(f"array memory overflow: allocated {self.next_mem_offset + size} > 256")
+                if self.next_mem_offset + size > 16:
+                    raise RuntimeError(f"array memory overflow: allocated {self.next_mem_offset + size} > 16 slots per frame")
                 base_offset = self.next_mem_offset
                 self.array_offsets[node.spelling] = (base_offset, size)
                 self.next_mem_offset += size
@@ -571,8 +769,8 @@ class FunctionCompiler:
                 decl = node.type.get_declaration()
                 fields = self._get_struct_fields(decl)
                 size = len(fields)
-                if self.next_mem_offset + size > 256:
-                    raise RuntimeError(f"struct memory overflow: allocated {self.next_mem_offset + size} > 256")
+                if self.next_mem_offset + size > 16:
+                    raise RuntimeError(f"struct memory overflow: allocated {self.next_mem_offset + size} > 16 slots per frame")
                 base_offset = self.next_mem_offset
                 field_map = {f.spelling: idx for idx, f in enumerate(fields)}
                 self.struct_offsets[node.spelling] = (base_offset, field_map)
@@ -622,12 +820,21 @@ class FunctionCompiler:
                             self.free_scratch_regs()
             else:
                 children = list(node.get_children())
-                r = self.alloc_reg()
-                self.var_reg[node.spelling] = r
-                if children:
-                    init_reg = self.compile_expr(children[0])
-                    self.b.binop_mov = None  # not used; MOV via ADD-with-0 pattern avoided
-                    self.copy_reg(r, init_reg)
+                if node.spelling in self.mem_vars:
+                    slot_offset = self.mem_vars[node.spelling]
+                    if children:
+                        val_reg = self.compile_expr(children[0])
+                        r_zero = self.alloc_reg()
+                        self.b.load_const(r_zero, 0)
+                        self.b.arr_store(slot_offset, r_zero, val_reg)
+                        self.free_scratch_regs()
+                else:
+                    r = self.alloc_reg()
+                    self.var_reg[node.spelling] = r
+                    if children:
+                        init_reg = self.compile_expr(children[0])
+                        self.b.binop_mov = None  # not used; MOV via ADD-with-0 pattern avoided
+                        self.copy_reg(r, init_reg)
 
         elif node.kind == ci.CursorKind.IF_STMT:
             children = list(node.get_children())
@@ -725,10 +932,27 @@ class FunctionCompiler:
                             self.b.load_const(r_zero2, 0)
                             self.b.arr_store(base_offset + idx, r_zero2, r_val)
                             self.free_scratch_regs()
+                elif target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.ref_params:
+                    r_src = self.compile_expr(rhs)
+                    r_ptr = self.var_reg[target.spelling]
+                    self.b.arr_store(0xFF, r_ptr, r_src)
+                elif target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.mem_vars:
+                    r_src = self.compile_expr(rhs)
+                    slot_offset = self.mem_vars[target.spelling]
+                    r_zero = self.alloc_reg()
+                    self.b.load_const(r_zero, 0)
+                    self.b.arr_store(slot_offset, r_zero, r_src)
                 elif target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.var_reg:
                     r_src = self.compile_expr(rhs)
                     r_dst = self.var_reg[target.spelling]
                     self.copy_reg(r_dst, r_src)
+                elif target.kind == ci.CursorKind.UNARY_OPERATOR:
+                    toks = [t.spelling for t in target.get_tokens()]
+                    if toks and toks[0] == "*":
+                        r_src = self.compile_expr(rhs)
+                        ptr_children = list(target.get_children())
+                        r_ptr = self.compile_expr(ptr_children[0])
+                        self.b.arr_store(0xFF, r_ptr, r_src)
                 elif target.kind == ci.CursorKind.ARRAY_SUBSCRIPT_EXPR:
                     r_src = self.compile_expr(rhs)
                     arr_name, idx_node = self.parse_array_subscript(target)
@@ -754,7 +978,32 @@ class FunctionCompiler:
             target = children[0]
             if target.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
                 target = list(target.get_children())[0]
-            if target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.var_reg:
+            if target.kind == ci.CursorKind.DECL_REF_EXPR and (target.spelling in self.mem_vars or target.spelling in self.ref_params):
+                r_zero = self.alloc_reg()
+                self.b.load_const(r_zero, 0)
+                cur_val_reg = self.alloc_reg()
+                if target.spelling in self.ref_params:
+                    r_ptr = self.var_reg[target.spelling]
+                    self.b.arr_load(cur_val_reg, 0xFF, r_ptr)
+                else:
+                    slot_offset = self.mem_vars[target.spelling]
+                    self.b.arr_load(cur_val_reg, slot_offset, r_zero)
+                one_reg = self.alloc_reg()
+                self.b.load_const(one_reg, 1)
+                new_val_reg = self.alloc_reg()
+                if '++' in tokens:
+                    self.b.binop(OP_ADD, new_val_reg, cur_val_reg, one_reg)
+                elif '--' in tokens:
+                    self.b.binop(OP_SUB, new_val_reg, cur_val_reg, one_reg)
+                else:
+                    raise RuntimeError(f"unsupported unary operator: {tokens}")
+                if target.spelling in self.ref_params:
+                    r_ptr = self.var_reg[target.spelling]
+                    self.b.arr_store(0xFF, r_ptr, new_val_reg)
+                else:
+                    slot_offset = self.mem_vars[target.spelling]
+                    self.b.arr_store(slot_offset, r_zero, new_val_reg)
+            elif target.kind == ci.CursorKind.DECL_REF_EXPR and target.spelling in self.var_reg:
                 r_var = self.var_reg[target.spelling]
                 one_reg = self.alloc_reg()
                 self.b.load_const(one_reg, 1)
@@ -866,6 +1115,18 @@ class FunctionCompiler:
 
         if node.kind == ci.CursorKind.DECL_REF_EXPR:
             name = node.spelling
+            if name in self.ref_params:
+                r_ptr = self.var_reg[name]
+                r_dst = self.alloc_reg()
+                self.b.arr_load(r_dst, 0xFF, r_ptr)
+                return r_dst
+            if name in self.mem_vars:
+                slot_offset = self.mem_vars[name]
+                r_dst = self.alloc_reg()
+                r_zero = self.alloc_reg()
+                self.b.load_const(r_zero, 0)
+                self.b.arr_load(r_dst, slot_offset, r_zero)
+                return r_dst
             if name in self.var_reg:
                 return self.var_reg[name]
             if name in self.arg_index:
@@ -880,6 +1141,30 @@ class FunctionCompiler:
             r = self.alloc_reg()
             self.b.load_const(r, val)
             return r
+
+        if node.kind == ci.CursorKind.UNARY_OPERATOR:
+            tokens = [t.spelling for t in node.get_tokens()]
+            children = list(node.get_children())
+            if tokens and tokens[0] == "&":
+                target = children[0]
+                while target.kind in (ci.CursorKind.UNEXPOSED_EXPR, ci.CursorKind.PAREN_EXPR):
+                    c = list(target.get_children())
+                    if c: target = c[0]
+                    else: break
+                if target.kind == ci.CursorKind.DECL_REF_EXPR:
+                    if target.spelling in self.mem_vars:
+                        slot_offset = self.mem_vars[target.spelling]
+                        r_dst = self.alloc_reg()
+                        self.b.load_frame_addr(r_dst, slot_offset)
+                        return r_dst
+                    elif target.spelling in self.ref_params or target.spelling in self.ptr_params:
+                        return self.var_reg[target.spelling]
+                raise RuntimeError(f"cannot take address of non-memory-backed variable '{getattr(target, 'spelling', '')}'")
+            elif tokens and tokens[0] == "*":
+                r_ptr = self.compile_expr(children[0])
+                r_dst = self.alloc_reg()
+                self.b.arr_load(r_dst, 0xFF, r_ptr)
+                return r_dst
 
         if node.kind == ci.CursorKind.ARRAY_SUBSCRIPT_EXPR:
             arr_name, idx_node = self.parse_array_subscript(node)
@@ -984,15 +1269,30 @@ class FunctionCompiler:
                 if len(children) > 1:
                     raw_args = children[1:]
 
+            callee_cursor = None
+            if hasattr(node, 'get_definition'):
+                callee_cursor = node.get_definition()
+            c_params = list(callee_cursor.get_arguments()) if (callee_cursor and callee_cursor.kind == ci.CursorKind.FUNCTION_DECL) else []
+
             arg_regs = []
-            for a in raw_args:
+            for idx, a in enumerate(raw_args):
                 unwrapped = self.unwrap_expr(a)
-                if unwrapped.kind == ci.CursorKind.DECL_REF_EXPR and unwrapped.spelling in self.struct_offsets:
+                p_param = c_params[idx] if idx < len(c_params) else None
+                if p_param and p_param.type.kind in (ci.TypeKind.LVALUEREFERENCE, ci.TypeKind.POINTER):
+                    sub = unwrapped
+                    if sub.kind == ci.CursorKind.DECL_REF_EXPR and sub.spelling in self.mem_vars:
+                        slot_offset = self.mem_vars[sub.spelling]
+                        r = self.alloc_reg()
+                        self.b.load_frame_addr(r, slot_offset)
+                        arg_regs.append(r)
+                    else:
+                        arg_regs.append(self.compile_expr(a))
+                elif unwrapped.kind == ci.CursorKind.DECL_REF_EXPR and unwrapped.spelling in self.struct_offsets:
                     base_offset, field_map = self.struct_offsets[unwrapped.spelling]
-                    for idx in range(len(field_map)):
+                    for f_idx in range(len(field_map)):
                         r = self.alloc_reg()
                         self.b.load_const(r, 0)
-                        self.b.arr_load(r, base_offset + idx, r)
+                        self.b.arr_load(r, base_offset + f_idx, r)
                         arg_regs.append(r)
                 elif unwrapped.type.kind == ci.TypeKind.RECORD:
                     if unwrapped.kind == ci.CursorKind.INIT_LIST_EXPR:
@@ -1002,9 +1302,9 @@ class FunctionCompiler:
                         self.compile_expr(unwrapped)
                         decl = unwrapped.type.get_declaration()
                         fields = self._get_struct_fields(decl)
-                        for idx in range(len(fields)):
+                        for f_idx in range(len(fields)):
                             r_f = self.alloc_reg()
-                            self.b.struct_ret_load(r_f, idx)
+                            self.b.struct_ret_load(r_f, f_idx)
                             arg_regs.append(r_f)
                     else:
                         raise RuntimeError(f"unsupported struct argument kind: {unwrapped.kind}")
