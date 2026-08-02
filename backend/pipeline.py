@@ -726,6 +726,58 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
     checksum = ctx.artifacts.get("bytecode_checksum", 0)
     checksum_str = f"0x{checksum:08x}u"
 
+    str_vm_parts = []
+    if ctx.eligible_str_funcs:
+        used_keys = set()
+        for f, bc, const_pool in ctx.eligible_str_funcs:
+            bc_arr_name = random_name(f"bc_str_{f.spelling}_")
+            pool_arr_name = random_name(f"pool_str_{f.spelling}_")
+            str_vm_parts.append(bytes_to_c_array(bc_arr_name, bc))
+
+            pool_elems = []
+            for s in const_pool:
+                raw_b = s.encode("utf-8")
+                while True:
+                    k = random.randint(1, 255)
+                    if k not in used_keys or len(used_keys) >= 254:
+                        used_keys.add(k)
+                        break
+                h_name = random_name("str_dec_")
+                h_code = generate_string_decode_function(h_name, raw_b, k)
+                ctx.string_decode_helpers.append(h_code)
+                pool_elems.append(f"{h_name}()")
+
+            pool_lits = ", ".join(pool_elems)
+            str_vm_parts.append(
+                f"static const std::string {pool_arr_name}[] = {{ {pool_lits} }};\n"
+                f"static const size_t {pool_arr_name}_len = {len(const_pool)};\n\n"
+            )
+
+            params = list(f.get_arguments())
+            param_list = ", ".join(f"{p.type.spelling} {p.spelling}" for p in params)
+            args_init = ", ".join(p.spelling for p in params)
+
+            str_checksum = ctx.artifacts.get(f"checksum_{f.spelling}", 0)
+            str_checksum_str = f"0x{str_checksum:08x}u"
+
+            ret_spelling = f.result_type.spelling
+            if "string" in ret_spelling or "basic_string" in ret_spelling:
+                str_vm_parts.append(
+                    f"{ret_spelling} {f.spelling}({param_list}) {{\n"
+                    f"    std::string __args[] = {{ {args_init} }};\n"
+                    f"    return vm_rt::run_str({bc_arr_name}, {bc_arr_name}_len, __args, {len(params)}, {pool_arr_name}, {pool_arr_name}_len, nullptr, {str_checksum_str});\n"
+                    f"}}\n\n"
+                )
+            else:
+                str_vm_parts.append(
+                    f"{ret_spelling} {f.spelling}({param_list}) {{\n"
+                    f"    std::string __args[] = {{ {args_init} }};\n"
+                    f"    int64_t __res = 0;\n"
+                    f"    vm_rt::run_str({bc_arr_name}, {bc_arr_name}_len, __args, {len(params)}, {pool_arr_name}, {pool_arr_name}_len, &__res, {str_checksum_str});\n"
+                    f"    return ({ret_spelling})__res;\n"
+                    f"}}\n\n"
+                )
+
     output_parts = [
         "// ================================================================\n"
         "// Auto-generated obfuscated output.\n"
@@ -757,47 +809,9 @@ def stage_assemble_output(ctx: PipelineContext) -> None:
                 f"}}\n\n"
             )
 
-    if ctx.eligible_str_funcs:
+    if str_vm_parts:
         output_parts.append("\n// ---- String VM functions ----\n")
-        def c_str_lit(s: str) -> str:
-            esc = s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-            return f'"{esc}"'
-
-        for f, bc, const_pool in ctx.eligible_str_funcs:
-            bc_arr_name = random_name(f"bc_str_{f.spelling}_")
-            pool_arr_name = random_name(f"pool_str_{f.spelling}_")
-            output_parts.append(bytes_to_c_array(bc_arr_name, bc))
-
-            pool_lits = ", ".join(c_str_lit(s) for s in const_pool)
-            output_parts.append(
-                f"static const std::string {pool_arr_name}[] = {{ {pool_lits} }};\n"
-                f"static const size_t {pool_arr_name}_len = {len(const_pool)};\n\n"
-            )
-
-            params = list(f.get_arguments())
-            param_list = ", ".join(f"{p.type.spelling} {p.spelling}" for p in params)
-            args_init = ", ".join(p.spelling for p in params)
-
-            str_checksum = ctx.artifacts.get(f"checksum_{f.spelling}", 0)
-            str_checksum_str = f"0x{str_checksum:08x}u"
-
-            ret_spelling = f.result_type.spelling
-            if "string" in ret_spelling or "basic_string" in ret_spelling:
-                output_parts.append(
-                    f"{ret_spelling} {f.spelling}({param_list}) {{\n"
-                    f"    std::string __args[] = {{ {args_init} }};\n"
-                    f"    return vm_rt::run_str({bc_arr_name}, {bc_arr_name}_len, __args, {len(params)}, {pool_arr_name}, {pool_arr_name}_len, nullptr, {str_checksum_str});\n"
-                    f"}}\n\n"
-                )
-            else:
-                output_parts.append(
-                    f"{ret_spelling} {f.spelling}({param_list}) {{\n"
-                    f"    std::string __args[] = {{ {args_init} }};\n"
-                    f"    int64_t __res = 0;\n"
-                    f"    vm_rt::run_str({bc_arr_name}, {bc_arr_name}_len, __args, {len(params)}, {pool_arr_name}, {pool_arr_name}_len, &__res, {str_checksum_str});\n"
-                    f"    return ({ret_spelling})__res;\n"
-                    f"}}\n\n"
-                )
+        output_parts.extend(str_vm_parts)
 
     if ctx.fallback_funcs:
         output_parts.append("\n// ---- Renamed (non-virtualized) functions ----\n")
